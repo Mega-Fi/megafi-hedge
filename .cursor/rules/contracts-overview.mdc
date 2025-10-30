@@ -1,0 +1,599 @@
+---
+alwaysApply: false
+---
+# Smart Contracts - Complete Technical Overview
+
+Comprehensive index and high-level overview of the MegaFi Hedge smart contracts system. Use this as a starting point to navigate to detailed documentation.
+
+## Documentation Structure
+
+This technical documentation is organized into 6 detailed files:
+
+1. **contracts-architecture.mdc** - System architecture, core contracts, and design patterns
+2. **contracts-pricing-system.mdc** - Pricing engine, volatility models, and oracle integration
+3. **contracts-libraries.mdc** - Mathematical libraries and utility functions
+4. **contracts-hedging-system.mdc** - Delta hedging reactors and protocol integrations
+5. **contracts-option-lifecycle.mdc** - Option lifecycle, Opyn integration, and registry
+6. **contracts-epoch-accounting.mdc** - Epoch system, deposits/withdrawals, and accounting
+
+## System Architecture at a Glance
+
+### Core Components
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     User Interfaces                             │
+│                                                                 │
+│  ┌──────────────────────┐        ┌──────────────────────┐     │
+│  │  OptionExchange.sol  │        │AlphaOptionHandler.sol│     │
+│  │  (Public Trading)    │        │   (OTC/Custom)       │     │
+│  └──────────┬───────────┘        └──────────┬───────────┘     │
+└─────────────┼──────────────────────────────┼──────────────────┘
+              │                              │
+              └──────────────┬───────────────┘
+                             │
+┌────────────────────────────▼──────────────────────────────────┐
+│                  LiquidityPool.sol                            │
+│            (Dynamic Hedging Vault - Core Logic)               │
+│                                                               │
+│  • Manages USDC deposits/withdrawals (epoch-based)           │
+│  • Issues shares (ERC20) representing vault ownership        │
+│  • Writes options and manages collateral                     │
+│  • Coordinates delta hedging across reactors                 │
+│  • Tracks liabilities and portfolio value                    │
+└────────────────┬──────────────────────┬─────────────────┬────┘
+                 │                      │                 │
+     ┌───────────▼─────────┐   ┌────────▼────────┐   ┌──▼─────────────┐
+     │ OptionRegistry.sol  │   │ HedgingReactors │   │BeyondPricer.sol│
+     │ (Opyn Integration)  │   │ (Delta Hedging) │   │  (Pricing)     │
+     └───────────┬─────────┘   └────────┬────────┘   └──┬─────────────┘
+                 │                      │                │
+     ┌───────────▼──────────────────────▼────────────────▼─────────┐
+     │                  Supporting Infrastructure                   │
+     │                                                              │
+     │  • Protocol.sol - Contract registry                         │
+     │  • PriceFeed.sol - Chainlink oracles                        │
+     │  • VolatilityFeed.sol - SABR volatility model              │
+     │  • AlphaPortfolioValuesFeed.sol - NAV calculation          │
+     │  • OptionCatalogue.sol - Approved series whitelist         │
+     └──────────────────────────────────────────────────────────────┘
+```
+
+## Contract Relationships
+
+### Contract Dependency Map
+
+```
+LiquidityPool
+  ├─→ Protocol (registry)
+  ├─→ OptionRegistry (option lifecycle)
+  ├─→ HedgingReactors[] (delta hedging)
+  ├─→ AlphaPortfolioValuesFeed (NAV)
+  └─→ PriceFeed (oracle prices)
+
+OptionExchange
+  ├─→ LiquidityPool (write/buy options)
+  ├─→ BeyondPricer (pricing)
+  ├─→ OptionCatalogue (approved series)
+  └─→ PriceFeed (oracle prices)
+
+BeyondPricer
+  ├─→ LiquidityPool (pool state)
+  ├─→ VolatilityFeed (implied vol)
+  ├─→ PriceFeed (spot price)
+  └─→ BlackScholes (math)
+
+OptionRegistry
+  ├─→ Opyn Controller (mint/burn)
+  ├─→ Opyn MarginCalculator (collateral)
+  ├─→ Opyn Oracle (settlement)
+  └─→ Opyn OtokenFactory (create series)
+
+HedgingReactors
+  ├─→ UniswapV3 (spot trading)
+  ├─→ RageTrade (perp futures)
+  └─→ GMX (perp futures)
+```
+
+## Key Contract Addresses
+
+### Immutable References
+
+Every contract stores immutable references to core assets:
+
+```solidity
+address public immutable underlyingAsset;   // WETH
+address public immutable strikeAsset;       // USDC
+address public immutable collateralAsset;   // USDC
+Protocol public immutable protocol;         // Registry
+```
+
+### Protocol Registry (Protocol.sol)
+
+Central address book:
+
+```solidity
+address public liquidityPool;
+address public optionRegistry;
+address public priceFeed;
+address public volatilityFeed;
+address public portfolioValuesFeed;
+address public accounting;
+```
+
+## Data Flow Examples
+
+### Example 1: User Buys Options
+
+```
+1. User → OptionExchange.operate()
+   ├─ Input: Series, amount, acceptablePremium
+   └─ Validates: Series in OptionCatalogue
+
+2. OptionExchange → BeyondPricer.quoteOptionPrice()
+   ├─ Gets: Spot price from PriceFeed
+   ├─ Gets: IV from VolatilityFeed
+   ├─ Calculates: Premium, delta, fees
+   └─ Returns: Quote
+
+3. OptionExchange → LiquidityPool.handlerWriteOption()
+   ├─ Checks: Available collateral
+   ├─ Allocates: Collateral for option
+   ├─ Updates: ephemeralDelta, ephemeralLiabilities
+   └─ Calls: OptionRegistry.issue()
+
+4. OptionRegistry → Opyn Controller
+   ├─ Creates: Vault (if needed)
+   ├─ Deposits: Collateral
+   ├─ Mints: oTokens
+   └─ Transfers: oTokens to user
+
+5. User receives: oToken ERC20 tokens
+```
+
+### Example 2: Vault Deposit & Withdrawal
+
+```
+1. User → LiquidityPool.deposit(1000 USDC)
+   ├─ Transfers: USDC to pool
+   ├─ Creates: DepositReceipt { epoch: N, amount: 1000 }
+   └─ Updates: pendingDeposits += 1000
+
+2. Keeper → LiquidityPool.executeEpochCalculation()
+   ├─ Calls: AlphaPortfolioValuesFeed.getPortfolioValues()
+   │   └─ Calculates: NAV from all positions
+   ├─ Calculates: depositPPS = NAV / totalShares
+   ├─ Sets: depositEpochPricePerShare[N] = PPS
+   └─ Increments: depositEpoch++
+
+3. User → LiquidityPool.completeDeposit()
+   ├─ Calculates: shares = amount / PPS
+   ├─ Mints: ERC20 shares to user
+   └─ Clears: DepositReceipt
+
+Withdrawal (similar flow):
+4. User → initiateWithdraw(shares)
+   ├─ Burns: Shares immediately
+   └─ Creates: WithdrawalReceipt
+
+5. Keeper → executeEpochCalculation()
+   └─ Sets aside: partitionedFunds
+
+6. User → completeWithdraw()
+   └─ Receives: USDC from partitionedFunds
+```
+
+### Example 3: Delta Hedging
+
+```
+1. Options Activity creates delta exposure
+   └─ LiquidityPool.ephemeralDelta = +10 ETH (too long)
+
+2. Keeper detects imbalance
+   └─ Calls: LiquidityPool.rebalancePortfolioDelta(-10 ETH, reactorIndex)
+
+3. LiquidityPool → HedgingReactor.hedgeDelta(-10 ETH)
+   
+4. HedgingReactor executes hedge:
+   
+   Option A - UniswapV3HedgingReactor:
+   └─ Sells 10 ETH on Uniswap V3
+   
+   Option B - PerpHedgingReactor:
+   ├─ Requests collateral from pool
+   └─ Opens short perp position (10 ETH) on Rage Trade
+   
+   Option C - GmxHedgingReactor:
+   └─ Creates short position (10 ETH) on GMX
+
+5. Reactor → returns new delta
+   └─ LiquidityPool.ephemeralDelta updated to ~0
+```
+
+## State Variables Summary
+
+### LiquidityPool.sol Critical State
+
+```solidity
+// Collateral
+uint256 public collateralAllocated;      // Locked in options
+uint256 public partitionedFunds;         // Reserved for withdrawals
+
+// Risk tracking
+int256 public ephemeralLiabilities;      // MTM value of options sold
+int256 public ephemeralDelta;            // Net delta exposure
+
+// Epochs
+uint256 public depositEpoch;
+uint256 public withdrawalEpoch;
+mapping(uint256 => uint256) public depositEpochPricePerShare;
+mapping(uint256 => uint256) public withdrawalEpochPricePerShare;
+
+// Pending flows
+uint256 public pendingDeposits;          // USDC waiting for epoch
+uint256 public pendingWithdrawals;       // Shares waiting for epoch
+
+// Risk parameters
+uint256 public bufferPercentage;         // Capital buffer (e.g., 50%)
+uint256 public collateralCap;            // Max TVL
+```
+
+### BeyondPricer.sol Critical State
+
+```solidity
+// Pricing parameters
+uint256 public bidAskIVSpread;           // IV spread between bid/ask
+uint256 public riskFreeRate;             // DeFi lending rate
+uint256 public slippageGradient;         // Slippage factor
+uint256 public collateralLendingRate;    // Collateral cost
+uint256 public deltaBandWidth;           // Delta band size
+
+// Delta band multipliers (per tenor)
+DeltaBandMultipliers[] internal tenorPricingParams;
+
+// Delta borrow rates
+DeltaBorrowRates public deltaBorrowRates;
+```
+
+### OptionRegistry.sol Critical State
+
+```solidity
+// Series tracking
+mapping(bytes32 => address) public seriesAddress;  // Hash → oToken
+mapping(address => Types.OptionSeries) public series;  // oToken → Series
+mapping(address => uint256) public vaultIds;       // oToken → Vault
+
+// Vault management
+uint256 public vaultIdCounter;
+mapping(uint256 => address) public vaultOwner;     // Vault → Owner
+```
+
+## Access Control
+
+### Role Hierarchy
+
+```
+GOVERNANCE_ROLE (Multi-sig)
+  └─→ Can grant/revoke all roles
+      └─→ Emergency contract upgrades
+
+MANAGER_ROLE (Operations team)
+  └─→ Set risk parameters
+  └─→ Approve hedging reactors
+  └─→ Manage option catalogue
+  └─→ Pause/unpause trading
+
+KEEPER_ROLE (Automated bots)
+  └─→ Execute epochs
+  └─→ Rebalance delta
+  └─→ Update volatility feeds
+  └─→ Settle expired options
+
+HANDLER (Approved contracts)
+  └─→ OptionExchange
+  └─→ AlphaOptionHandler
+  └─→ Can write/buy options on behalf of pool
+```
+
+### Critical Functions Access Control
+
+```solidity
+// GOVERNANCE only
+function grantRole(bytes32 role, address account)
+function revokeRole(bytes32 role, address account)
+
+// MANAGER only
+function setBufferPercentage(uint256 _bufferPercentage)
+function addHedgingReactor(address reactor)
+function pause() / unpause()
+function setCollateralCap(uint256 _cap)
+
+// KEEPER only
+function executeEpochCalculation()
+function rebalancePortfolioDelta(int256 delta, uint256 reactorIndex)
+
+// HANDLER only
+function handlerWriteOption(...)
+function handlerBuybackOption(...)
+```
+
+## Events
+
+### Key Events for Monitoring
+
+```solidity
+// LiquidityPool
+event Deposit(address indexed user, uint256 amount, uint256 epoch);
+event WithdrawInitiated(address indexed user, uint256 shares, uint256 epoch);
+event EpochExecuted(uint256 depositEpoch, uint256 withdrawalEpoch, uint256 nav, uint256 timestamp);
+event OptionWritten(address series, uint256 amount, uint256 premium, int256 delta);
+event OptionBought(address series, uint256 amount, uint256 premium, int256 delta);
+event DeltaRebalanced(int256 oldDelta, int256 newDelta, uint256 reactorIndex);
+
+// OptionExchange
+event OptionTraded(address indexed user, address series, uint256 amount, uint256 premium, bool isBuy);
+
+// OptionRegistry
+event OptionTokenCreated(address indexed otoken, bytes32 indexed seriesHash, Types.OptionSeries series);
+event OptionIssued(address indexed otoken, uint256 vaultId, uint256 amount, uint256 collateral, address issuer);
+event OptionBurned(address indexed otoken, uint256 vaultId, uint256 amount, uint256 collateralReturned);
+event VaultSettled(address indexed otoken, uint256 vaultId, uint256 settlementPrice, uint256 payout);
+
+// HedgingReactors
+event HedgeExecuted(int256 deltaTrade, int256 newPosition, uint256 timestamp);
+event PositionHealthChanged(bool isHealthy, uint256 marginRatio);
+```
+
+## Testing & Verification
+
+### Test Coverage
+
+```
+test/
+├── BlackScholes.ts              # Pricing math accuracy
+├── LiquidityPool.ts             # Vault core logic
+├── LiquidityPoolDepositWithdraw.ts  # Epoch system
+├── OptionExchange.ts            # Trading interface
+├── ExchangeActions.ts           # Complex trading flows
+├── PerpHedgingReactor.ts        # Hedging mechanisms
+├── UniswapV3HedgingReactor.ts
+├── GmxHedgingReactor.ts
+├── PortfolioValuesFeedAlpha.ts  # NAV calculation
+├── PriceFeed.ts                 # Oracle integration
+├── SABRVolatilityFeed.ts        # Volatility modeling
+└── QuoteOptionPrice.ts          # Pricing accuracy
+```
+
+### Key Test Scenarios
+
+1. **Deposit/Withdrawal Cycles**: Multiple users, multiple epochs
+2. **Option Writing/Closing**: Various strikes, expirations, sizes
+3. **Delta Hedging**: Automatic rebalancing across reactors
+4. **Epoch Execution**: NAV calculation, PPS determination
+5. **Settlement**: ITM/OTM options at expiry
+6. **Edge Cases**: Zero liquidity, max collateral, extreme prices
+7. **Access Control**: Role restrictions enforced
+8. **Gas Optimization**: Efficient execution paths
+
+## Deployment Process
+
+### 1. Deploy Core Infrastructure
+
+```typescript
+// 1. Deploy Protocol registry
+const protocol = await Protocol.deploy();
+
+// 2. Deploy price feeds
+const priceFeed = await PriceFeed.deploy(protocol.address);
+const volatilityFeed = await VolatilityFeed.deploy(protocol.address);
+const portfolioValuesFeed = await AlphaPortfolioValuesFeed.deploy(protocol.address);
+
+// 3. Register in Protocol
+await protocol.setPriceFeed(priceFeed.address);
+await protocol.setVolatilityFeed(volatilityFeed.address);
+await protocol.setPortfolioValuesFeed(portfolioValuesFeed.address);
+```
+
+### 2. Deploy Option Infrastructure
+
+```typescript
+// 4. Deploy OptionRegistry
+const optionRegistry = await OptionRegistry.deploy(
+    protocol.address,
+    liquidityPoolAddress,  // To be set
+    addressBook,           // Opyn
+    collateralAsset,
+    underlyingAsset,
+    strikeAsset
+);
+
+// 5. Deploy OptionCatalogue
+const catalogue = await OptionCatalogue.deploy(liquidityPoolAddress);
+```
+
+### 3. Deploy Vault & Pricing
+
+```typescript
+// 6. Deploy LiquidityPool
+const liquidityPool = await LiquidityPool.deploy(
+    protocol.address,
+    strikeAsset,
+    underlyingAsset,
+    collateralAsset,
+    "DHV Shares",
+    "DHV"
+);
+
+// 7. Deploy BeyondPricer
+const pricer = await BeyondPricer.deploy(
+    liquidityPool.address,
+    protocol.address,
+    addressBook
+);
+```
+
+### 4. Deploy Trading Interfaces
+
+```typescript
+// 8. Deploy OptionExchange
+const exchange = await OptionExchange.deploy(
+    liquidityPool.address,
+    protocol.address,
+    pricer.address,
+    catalogue.address,
+    collateralAsset,
+    underlyingAsset,
+    strikeAsset,
+    addressBook,
+    swapRouter
+);
+
+// 9. Deploy AlphaOptionHandler
+const handler = await AlphaOptionHandler.deploy(
+    liquidityPool.address,
+    protocol.address,
+    pricer.address
+);
+```
+
+### 5. Deploy Hedging Reactors
+
+```typescript
+// 10. Deploy hedging reactors
+const uniswapReactor = await UniswapV3HedgingReactor.deploy(...);
+const perpReactor = await PerpHedgingReactor.deploy(...);
+const gmxReactor = await GmxHedgingReactor.deploy(...);
+
+// 11. Add to pool
+await liquidityPool.addHedgingReactor(uniswapReactor.address);
+await liquidityPool.addHedgingReactor(perpReactor.address);
+await liquidityPool.addHedgingReactor(gmxReactor.address);
+```
+
+### 6. Configuration
+
+```typescript
+// 12. Approve handlers
+await liquidityPool.setHandler(exchange.address, true);
+await liquidityPool.setHandler(handler.address, true);
+
+// 13. Set parameters
+await liquidityPool.setBufferPercentage(5000);  // 50%
+await liquidityPool.setCollateralCap(parseUSDC("10000000"));  // $10M
+
+// 14. Set pricing parameters
+await pricer.setBidAskIVSpread(parseUnits("0.02", 18));  // 2%
+await pricer.setSlippageGradient(parseUnits("0.001", 18));
+
+// 15. Grant roles
+await liquidityPool.grantRole(KEEPER_ROLE, keeperAddress);
+await liquidityPool.grantRole(MANAGER_ROLE, managerAddress);
+```
+
+## Gas Optimization
+
+### Techniques Used
+
+1. **Immutable Variables**: Deployment-time constants stored in bytecode
+2. **Storage Packing**: Carefully ordered structs to minimize slots
+3. **Batch Operations**: Epoch system batches many user operations
+4. **View Functions**: Calculations off-chain where possible
+5. **Custom Errors**: More efficient than string reverts
+6. **Assembly**: Critical path optimizations (SafeTransferLib)
+7. **Event Indexing**: Historical data via events, not storage
+
+### Gas Benchmarks (Arbitrum)
+
+```
+Function                          Gas Cost
+──────────────────────────────────────────
+deposit()                         ~80,000
+initiateWithdraw()                ~60,000
+completeDeposit()                 ~100,000
+completeWithdraw()                ~80,000
+executeEpochCalculation()         ~500,000
+operate() [buy option]            ~350,000
+operateClose() [sell option]      ~300,000
+hedgeDelta() [spot]               ~200,000
+hedgeDelta() [perp]               ~400,000
+```
+
+## Security Considerations
+
+### Key Security Features
+
+1. **Reentrancy Guards**: All external functions protected
+2. **Access Control**: Strict role-based permissions
+3. **Pausability**: Emergency pause for trading
+4. **Slippage Protection**: User-specified acceptable premiums
+5. **Oracle Validation**: Staleness and circuit breaker checks
+6. **Collateral Tracking**: Precise accounting prevents over-commitment
+7. **Epoch System**: Prevents front-running deposits/withdrawals
+8. **Partitioned Funds**: Withdrawal funds segregated
+
+### Potential Risks
+
+1. **Oracle Manipulation**: Mitigated by Chainlink + validation
+2. **Opyn Protocol Risk**: Dependency on external protocol
+3. **Hedging Protocol Risk**: Rage Trade, GMX, Uniswap dependencies
+4. **Liquidation Risk**: Perp hedging reactors under-collateralized
+5. **Smart Contract Risk**: Bugs in complex financial logic
+6. **Economic Attacks**: Vault manipulation via large deposits/withdrawals
+
+### Recommended Audits
+
+- [ ] Core contract logic (LiquidityPool, OptionRegistry)
+- [ ] Pricing engine (BeyondPricer, BlackScholes)
+- [ ] Epoch system (deposit/withdrawal flows)
+- [ ] Hedging reactors (external protocol interactions)
+- [ ] Access control and pausability
+- [ ] Oracle integration and validation
+
+## Quick Reference
+
+### Main Contracts Summary
+
+| Contract | Purpose | Key Functions |
+|----------|---------|---------------|
+| **LiquidityPool** | Vault core | deposit(), executeEpochCalculation(), handlerWriteOption() |
+| **OptionExchange** | Public trading | operate(), operateClose(), quoteOptionPrice() |
+| **BeyondPricer** | Pricing engine | quoteOptionPrice() |
+| **OptionRegistry** | Opyn interface | issue(), burn(), settle() |
+| **UniswapV3HedgingReactor** | Spot hedging | hedgeDelta() |
+| **PerpHedgingReactor** | Perp hedging | hedgeDelta(), rebalanceMargin() |
+
+### Key Calculations
+
+```solidity
+// Price Per Share
+PPS = NAV / totalShares
+
+// NAV
+NAV = collateralBalance + collateralInUse + hedgingValue - liabilities
+
+// Available Collateral
+available = (balance * (1 - bufferPct)) - allocated
+
+// Option Delta
+delta = BlackScholes.calculateDelta(...)
+
+// Slippage
+slippage = baseSlippage * deltaBandMultiplier * poolExposure
+```
+
+---
+
+## Navigation Guide
+
+For detailed information on specific topics:
+
+1. **Understanding the system architecture** → Read contracts-architecture.mdc
+2. **How options are priced** → Read contracts-pricing-system.mdc
+3. **Mathematical calculations** → Read contracts-libraries.mdc
+4. **How delta hedging works** → Read contracts-hedging-system.mdc
+5. **Option lifecycle and Opyn** → Read contracts-option-lifecycle.mdc
+6. **Deposits, withdrawals, epochs** → Read contracts-epoch-accounting.mdc
+
+---
+
+**This completes the comprehensive technical documentation of the MegaFi Hedge smart contracts system.**

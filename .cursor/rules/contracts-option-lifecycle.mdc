@@ -1,0 +1,788 @@
+---
+alwaysApply: false
+---
+# Option Registry & Lifecycle Management
+
+Technical documentation for option lifecycle management, Opyn Gamma Protocol integration, and the option registry system.
+
+## OptionRegistry.sol - Option Token Management
+
+### Overview
+
+The OptionRegistry serves as the interface between MegaFi and Opyn's Gamma Protocol, managing option creation, minting, burning, settlement, and exercise.
+
+### Contract Structure
+
+```solidity
+contract OptionRegistry is AccessControl, ReentrancyGuard
+```
+
+### State Variables
+
+```solidity
+// Core references
+Protocol public immutable protocol;
+ILiquidityPool public immutable liquidityPool;
+
+// Opyn Gamma Protocol contracts
+AddressBookInterface public immutable addressBook;
+IController public controller;
+IMarginCalculator public calculator;
+IOtokenFactory public otokenFactory;
+IOracle public oracle;
+IWhitelist public whitelist;
+
+// Asset configuration
+address public immutable collateralAsset;    // USDC
+address public immutable underlyingAsset;    // WETH
+address public immutable strikeAsset;        // USDC
+
+// Series tracking
+mapping(bytes32 => address) public seriesAddress;     // Hash => oToken address
+mapping(address => Types.OptionSeries) public series; // oToken => Series data
+mapping(address => uint256) public vaultIds;          // oToken => Vault ID
+
+// Vault management
+uint256 public vaultIdCounter;
+mapping(uint256 => address) public vaultOwner;        // Vault ID => Owner (pool)
+```
+
+### Option Series Management
+
+**Create Option Series**:
+```solidity
+function createOptionToken(
+    Types.OptionSeries memory optionSeries
+) public returns (address otokenAddress)
+```
+
+**Process**:
+
+1. **Generate Series Hash**:
+```solidity
+bytes32 seriesHash = keccak256(abi.encode(optionSeries));
+```
+
+2. **Check if Already Exists**:
+```solidity
+otokenAddress = seriesAddress[seriesHash];
+if (otokenAddress != address(0)) {
+    // Already created, return existing
+    return otokenAddress;
+}
+```
+
+3. **Validate Series Parameters**:
+```solidity
+require(optionSeries.expiration > block.timestamp, "Expired");
+require(optionSeries.expiration < block.timestamp + 365 days, "Too far");
+require(optionSeries.strike > 0, "Invalid strike");
+require(
+    whitelist.isWhitelistedCollateral(optionSeries.collateral),
+    "Collateral not whitelisted"
+);
+```
+
+4. **Create oToken via Opyn Factory**:
+```solidity
+otokenAddress = otokenFactory.createOtoken(
+    optionSeries.underlying,
+    optionSeries.strikeAsset,
+    optionSeries.collateral,
+    optionSeries.strike,
+    optionSeries.expiration,
+    optionSeries.isPut
+);
+```
+
+5. **Store Series Info**:
+```solidity
+seriesAddress[seriesHash] = otokenAddress;
+series[otokenAddress] = optionSeries;
+
+emit OptionTokenCreated(
+    otokenAddress,
+    seriesHash,
+    optionSeries
+);
+```
+
+**Get Series Address**:
+```solidity
+function getSeriesAddress(
+    Types.OptionSeries memory optionSeries
+) public view returns (address)
+```
+
+```solidity
+bytes32 seriesHash = keccak256(abi.encode(optionSeries));
+return seriesAddress[seriesHash];
+```
+
+**Get Series Info**:
+```solidity
+function getSeries(
+    address otokenAddress
+) public view returns (Types.OptionSeries memory)
+```
+
+```solidity
+return series[otokenAddress];
+```
+
+### Option Minting (Writing)
+
+**Open Vault**:
+```solidity
+function openVault() external returns (uint256 vaultId)
+```
+
+```solidity
+vaultId = ++vaultIdCounter;
+vaultOwner[vaultId] = msg.sender;
+
+// Open vault in Opyn Controller
+IController.ActionArgs[] memory actions = new IController.ActionArgs[](1);
+actions[0] = IController.ActionArgs({
+    actionType: IController.ActionType.OpenVault,
+    owner: address(this),
+    secondAddress: address(0),
+    asset: address(0),
+    vaultId: vaultId,
+    amount: 0,
+    index: 0,
+    data: ""
+});
+
+controller.operate(actions);
+
+emit VaultOpened(vaultId, msg.sender);
+```
+
+**Issue Option** (Complete Flow):
+```solidity
+function issue(
+    Types.OptionSeries memory optionSeries,
+    uint256 amount
+) external nonReentrant returns (address seriesAddress, uint256 vaultId)
+```
+
+**Process**:
+
+1. **Create or Get Series**:
+```solidity
+seriesAddress = createOptionToken(optionSeries);
+```
+
+2. **Get or Create Vault**:
+```solidity
+vaultId = vaultIds[seriesAddress];
+if (vaultId == 0) {
+    // Open new vault for this series
+    vaultId = openVault();
+    vaultIds[seriesAddress] = vaultId;
+}
+```
+
+3. **Calculate Collateral Required**:
+```solidity
+uint256 collateralAmount = calculator.getNakedMarginRequired(
+    optionSeries.underlying,
+    optionSeries.strikeAsset,
+    optionSeries.collateral,
+    amount,
+    optionSeries.strike,
+    optionSeries.isPut
+);
+```
+
+4. **Transfer Collateral from Pool**:
+```solidity
+SafeTransferLib.safeTransferFrom(
+    optionSeries.collateral,
+    msg.sender,
+    address(this),
+    collateralAmount
+);
+```
+
+5. **Execute Actions** (Deposit Collateral + Mint):
+```solidity
+IController.ActionArgs[] memory actions = new IController.ActionArgs[](2);
+
+// Action 1: Deposit collateral
+actions[0] = IController.ActionArgs({
+    actionType: IController.ActionType.DepositCollateral,
+    owner: address(this),
+    secondAddress: address(this),
+    asset: optionSeries.collateral,
+    vaultId: vaultId,
+    amount: collateralAmount,
+    index: 0,
+    data: ""
+});
+
+// Action 2: Mint short option
+actions[1] = IController.ActionArgs({
+    actionType: IController.ActionType.MintShortOption,
+    owner: address(this),
+    secondAddress: msg.sender,  // Send oTokens to caller
+    asset: seriesAddress,
+    vaultId: vaultId,
+    amount: amount,
+    index: 0,
+    data: ""
+});
+
+controller.operate(actions);
+
+emit OptionIssued(
+    seriesAddress,
+    vaultId,
+    amount,
+    collateralAmount,
+    msg.sender
+);
+```
+
+**Mint More Options** (Existing Vault):
+```solidity
+function mint(
+    address otokenAddress,
+    uint256 amount
+) external nonReentrant
+```
+
+Similar to issue but uses existing vault:
+
+```solidity
+uint256 vaultId = vaultIds[otokenAddress];
+require(vaultId != 0, "Vault not found");
+
+// Calculate additional collateral needed
+uint256 additionalCollateral = _calculateAdditionalCollateral(
+    vaultId,
+    amount
+);
+
+// Deposit and mint
+_depositAndMint(vaultId, otokenAddress, additionalCollateral, amount);
+```
+
+### Option Burning (Closing)
+
+**Burn Option**:
+```solidity
+function burn(
+    address otokenAddress,
+    uint256 amount
+) external nonReentrant returns (uint256 collateralReturned)
+```
+
+**Process**:
+
+1. **Validate**:
+```solidity
+uint256 vaultId = vaultIds[otokenAddress];
+require(vaultId != 0, "Vault not found");
+require(vaultOwner[vaultId] == msg.sender, "Not vault owner");
+```
+
+2. **Transfer oTokens to Registry**:
+```solidity
+SafeTransferLib.safeTransferFrom(
+    otokenAddress,
+    msg.sender,
+    address(this),
+    amount
+);
+```
+
+3. **Calculate Collateral to Return**:
+```solidity
+Types.OptionSeries memory optionSeries = series[otokenAddress];
+
+// Get vault state
+GammaTypes.Vault memory vault = controller.getVault(
+    address(this),
+    vaultId
+);
+
+// Pro-rata collateral return
+uint256 totalShort = vault.shortAmounts[0];
+collateralReturned = (vault.collateralAmounts[0] * amount) / totalShort;
+```
+
+4. **Execute Actions** (Burn + Withdraw Collateral):
+```solidity
+IController.ActionArgs[] memory actions = new IController.ActionArgs[](2);
+
+// Action 1: Burn short option
+actions[0] = IController.ActionArgs({
+    actionType: IController.ActionType.BurnShortOption,
+    owner: address(this),
+    secondAddress: address(this),
+    asset: otokenAddress,
+    vaultId: vaultId,
+    amount: amount,
+    index: 0,
+    data: ""
+});
+
+// Action 2: Withdraw collateral
+actions[1] = IController.ActionArgs({
+    actionType: IController.ActionType.WithdrawCollateral,
+    owner: address(this),
+    secondAddress: msg.sender,  // Return to caller
+    asset: optionSeries.collateral,
+    vaultId: vaultId,
+    amount: collateralReturned,
+    index: 0,
+    data: ""
+});
+
+controller.operate(actions);
+
+emit OptionBurned(
+    otokenAddress,
+    vaultId,
+    amount,
+    collateralReturned,
+    msg.sender
+);
+```
+
+### Option Settlement
+
+**Settle at Expiry**:
+```solidity
+function settle(
+    address otokenAddress
+) external nonReentrant returns (uint256 payout)
+```
+
+**Process**:
+
+1. **Validate Expiry**:
+```solidity
+Types.OptionSeries memory optionSeries = series[otokenAddress];
+require(block.timestamp >= optionSeries.expiration, "Not expired");
+```
+
+2. **Get Settlement Price**:
+```solidity
+uint256 settlementPrice = oracle.getExpiryPrice(
+    optionSeries.underlying,
+    optionSeries.expiration
+);
+require(settlementPrice > 0, "Price not set");
+```
+
+3. **Calculate Payout**:
+```solidity
+uint256 vaultId = vaultIds[otokenAddress];
+
+GammaTypes.Vault memory vault = controller.getVault(
+    address(this),
+    vaultId
+);
+
+payout = calculator.getExcessCollateral(vault, vaultId);
+```
+
+4. **Settle Vault**:
+```solidity
+IController.ActionArgs[] memory actions = new IController.ActionArgs[](1);
+
+actions[0] = IController.ActionArgs({
+    actionType: IController.ActionType.SettleVault,
+    owner: address(this),
+    secondAddress: msg.sender,  // Payout recipient
+    asset: address(0),
+    vaultId: vaultId,
+    amount: 0,
+    index: 0,
+    data: ""
+});
+
+controller.operate(actions);
+
+emit VaultSettled(
+    otokenAddress,
+    vaultId,
+    settlementPrice,
+    payout,
+    msg.sender
+);
+```
+
+**Example Settlement Scenarios**:
+
+**Call Option - ITM**:
+```solidity
+// Series: ETH $2000 call
+// Settlement price: $2500
+// Amount written: 10 ETH
+// Collateral: 10 ETH
+
+// Intrinsic value: ($2500 - $2000) * 10 = $5000
+// Payout to option holders: $5000 / $2500 = 2 ETH
+
+// Collateral returned to vault: 10 - 2 = 8 ETH
+payout = 8e18;
+```
+
+**Put Option - ITM**:
+```solidity
+// Series: ETH $2000 put
+// Settlement price: $1500
+// Amount written: 10 ETH
+// Collateral: $20,000 USDC
+
+// Intrinsic value: ($2000 - $1500) * 10 = $5000
+// Payout to option holders: $5000
+
+// Collateral returned: $20,000 - $5,000 = $15,000
+payout = 15000e6;
+```
+
+**OTM Option**:
+```solidity
+// Option expires worthless
+// Full collateral returned to vault
+payout = totalCollateral;
+```
+
+### Option Exercise (Before Expiry)
+
+**Redeem/Exercise**:
+```solidity
+function redeem(
+    address otokenAddress,
+    uint256 amount
+) external nonReentrant returns (uint256 payout)
+```
+
+**Process**:
+
+1. **Validate**:
+```solidity
+Types.OptionSeries memory optionSeries = series[otokenAddress];
+require(block.timestamp < optionSeries.expiration, "Already expired");
+```
+
+2. **Calculate Intrinsic Value**:
+```solidity
+uint256 currentPrice = oracle.getPrice(optionSeries.underlying);
+
+uint256 intrinsicValue;
+if (optionSeries.isPut) {
+    if (optionSeries.strike > currentPrice) {
+        intrinsicValue = optionSeries.strike - currentPrice;
+    }
+} else {
+    if (currentPrice > optionSeries.strike) {
+        intrinsicValue = currentPrice - optionSeries.strike;
+    }
+}
+
+require(intrinsicValue > 0, "OTM, no intrinsic value");
+```
+
+3. **Transfer oTokens**:
+```solidity
+SafeTransferLib.safeTransferFrom(
+    otokenAddress,
+    msg.sender,
+    address(this),
+    amount
+);
+```
+
+4. **Redeem via Controller**:
+```solidity
+IController.ActionArgs[] memory actions = new IController.ActionArgs[](1);
+
+actions[0] = IController.ActionArgs({
+    actionType: IController.ActionType.Redeem,
+    owner: address(0),
+    secondAddress: msg.sender,
+    asset: otokenAddress,
+    vaultId: 0,
+    amount: amount,
+    index: 0,
+    data: ""
+});
+
+controller.operate(actions);
+
+emit OptionRedeemed(
+    otokenAddress,
+    amount,
+    intrinsicValue,
+    msg.sender
+);
+```
+
+### Collateral Management
+
+**Check Collateral Adequacy**:
+```solidity
+function isVaultCollateralized(
+    uint256 vaultId
+) public view returns (bool)
+```
+
+```solidity
+GammaTypes.Vault memory vault = controller.getVault(address(this), vaultId);
+
+if (vault.shortAmounts.length == 0) {
+    return true;  // No short position
+}
+
+// Check margin requirements
+bool isMarginSufficient = calculator.isLiquidatable(
+    vault,
+    vaultId
+);
+
+return !isMarginSufficient;  // Not liquidatable = properly collateralized
+```
+
+**Add Collateral**:
+```solidity
+function addCollateral(
+    uint256 vaultId,
+    address collateralAsset,
+    uint256 amount
+) external nonReentrant
+```
+
+```solidity
+require(vaultOwner[vaultId] == msg.sender, "Not owner");
+
+SafeTransferLib.safeTransferFrom(
+    collateralAsset,
+    msg.sender,
+    address(this),
+    amount
+);
+
+IController.ActionArgs[] memory actions = new IController.ActionArgs[](1);
+
+actions[0] = IController.ActionArgs({
+    actionType: IController.ActionType.DepositCollateral,
+    owner: address(this),
+    secondAddress: address(this),
+    asset: collateralAsset,
+    vaultId: vaultId,
+    amount: amount,
+    index: 0,
+    data: ""
+});
+
+controller.operate(actions);
+
+emit CollateralAdded(vaultId, collateralAsset, amount);
+```
+
+**Remove Excess Collateral**:
+```solidity
+function removeCollateral(
+    uint256 vaultId,
+    address collateralAsset,
+    uint256 amount
+) external nonReentrant
+```
+
+```solidity
+require(vaultOwner[vaultId] == msg.sender, "Not owner");
+
+// Ensure vault remains collateralized
+GammaTypes.Vault memory vault = controller.getVault(address(this), vaultId);
+uint256 excessCollateral = calculator.getExcessCollateral(vault, vaultId);
+
+require(amount <= excessCollateral, "Insufficient excess");
+
+IController.ActionArgs[] memory actions = new IController.ActionArgs[](1);
+
+actions[0] = IController.ActionArgs({
+    actionType: IController.ActionType.WithdrawCollateral,
+    owner: address(this),
+    secondAddress: msg.sender,
+    asset: collateralAsset,
+    vaultId: vaultId,
+    amount: amount,
+    index: 0,
+    data: ""
+});
+
+controller.operate(actions);
+
+emit CollateralRemoved(vaultId, collateralAsset, amount);
+```
+
+## Option Lifecycle States
+
+### State Diagram
+
+```
+┌──────────────┐
+│   Created    │  createOptionToken()
+└──────┬───────┘
+       │
+       ▼
+┌──────────────┐
+│   Minted     │  issue() / mint()
+└──────┬───────┘
+       │
+       ├──────────────┐
+       │              │
+       ▼              ▼
+┌──────────────┐  ┌──────────────┐
+│    Burned    │  │   Traded     │  User-to-user transfers
+└──────┬───────┘  └──────┬───────┘
+       │                 │
+       │                 │
+       ▼                 ▼
+┌──────────────────────────┐
+│      Expiry Time         │
+└──────┬───────────────────┘
+       │
+       ├──────────────┬─────────────┐
+       │              │             │
+       ▼              ▼             ▼
+┌──────────┐  ┌──────────┐  ┌──────────┐
+│   ITM    │  │   ATM    │  │   OTM    │
+│ Settled  │  │ Settled  │  │ Worthless│
+└──────────┘  └──────────┘  └──────────┘
+```
+
+### State Transitions
+
+1. **Created**: Option series registered, oToken deployed
+2. **Minted**: Option tokens minted, collateral locked
+3. **Burned**: Position closed early, collateral returned
+4. **Traded**: oTokens transferred between users
+5. **Exercised**: ITM option redeemed before expiry (American-style)
+6. **Settled**: Expired option settled based on settlement price
+7. **Worthless**: OTM option expires, full collateral returned
+
+## Opyn Gamma Protocol Integration
+
+### Key Concepts
+
+**oToken (Option Token)**:
+- ERC20 token representing an option
+- Each oToken = right to 1 unit of underlying
+- Automatically cash-settled at expiry
+
+**Vault**:
+- Holds collateral for short options
+- Tracks positions (short options, long options, collateral)
+- Can be liquidated if under-collateralized
+
+**Controller**:
+- Central contract for all actions
+- Executes atomic multi-action transactions
+- Enforces margin requirements
+
+**Margin Calculator**:
+- Calculates collateral requirements
+- Determines liquidation conditions
+- Supports various collateral types
+
+**Oracle**:
+- Provides spot prices
+- Sets settlement prices at expiry
+- Chainlink-based for security
+
+### Action Types
+
+Opyn Controller supports these actions:
+
+```solidity
+enum ActionType {
+    OpenVault,              // 0
+    MintShortOption,        // 1
+    BurnShortOption,        // 2
+    DepositLongOption,      // 3
+    WithdrawLongOption,     // 4
+    DepositCollateral,      // 5
+    WithdrawCollateral,     // 6
+    SettleVault,            // 7
+    Redeem,                 // 8
+    Call                    // 9
+}
+```
+
+### Example Multi-Action Transaction
+
+**Write Covered Call**:
+```solidity
+IController.ActionArgs[] memory actions = new IController.ActionArgs[](3);
+
+// 1. Open vault
+actions[0] = IController.ActionArgs({
+    actionType: IController.ActionType.OpenVault,
+    ...
+});
+
+// 2. Deposit collateral (e.g., 10 WETH)
+actions[1] = IController.ActionArgs({
+    actionType: IController.ActionType.DepositCollateral,
+    asset: WETH,
+    amount: 10e18,
+    ...
+});
+
+// 3. Mint call options
+actions[2] = IController.ActionArgs({
+    actionType: IController.ActionType.MintShortOption,
+    asset: callOptionAddress,
+    amount: 10e8,  // 10 options (8 decimals)
+    ...
+});
+
+controller.operate(actions);
+```
+
+**Close Position**:
+```solidity
+// 1. Burn options
+// 2. Withdraw collateral
+// Single atomic transaction
+```
+
+### Margin Requirements
+
+**Naked Option**:
+```solidity
+margin = max(
+    (spotPrice * amount * marginRequired),
+    (strike * amount * minMargin)
+)
+```
+
+**Spread**:
+```solidity
+margin = max(
+    longOptionValue - shortOptionValue,
+    minMargin
+)
+```
+
+**Collateralized**:
+```solidity
+margin = amount * (strike for put, 1 underlying for call)
+```
+
+---
+
+**Key Takeaways**:
+- ✅ OptionRegistry abstracts Opyn complexity
+- ✅ Vault system enables efficient collateral management
+- ✅ Multi-action transactions ensure atomic operations
+- ✅ Settlement is automated and trustless
+- ✅ American-style options allow early exercise
+- ✅ Margin requirements prevent insolvency

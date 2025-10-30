@@ -1,0 +1,781 @@
+---
+alwaysApply: false
+---
+# Epoch System, Accounting & Operations
+
+Technical documentation for the epoch-based deposit/withdrawal system, accounting mechanisms, and operational procedures in the Dynamic Hedging Vault.
+
+## Epoch System Overview
+
+### Why Epochs?
+
+The Dynamic Hedging Vault uses an epoch-based system for deposits and withdrawals to:
+
+1. **Prevent Front-Running**: Users can't time entries/exits based on short-term performance
+2. **Fair Pricing**: All deposits in an epoch get same price per share
+3. **Operational Efficiency**: Batch processing reduces gas costs
+4. **NAV Accuracy**: Ensures accurate valuation before processing flows
+5. **Risk Management**: Allows vault to prepare for large redemptions
+
+### Epoch Lifecycle
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                    Epoch N                                 │
+│                                                            │
+│  Users: deposit() / initiateWithdraw()                    │
+│  System: Accumulate deposits/withdrawals                  │
+│  Duration: Typically 24-48 hours                          │
+└────────────────┬───────────────────────────────────────────┘
+                 │
+                 ▼
+┌────────────────────────────────────────────────────────────┐
+│              Epoch Execution                               │
+│                                                            │
+│  Keeper calls: executeEpochCalculation()                  │
+│  1. Calculate NAV                                          │
+│  2. Determine Price Per Share (PPS)                       │
+│  3. Set depositEpochPricePerShare[N]                      │
+│  4. Set withdrawalEpochPricePerShare[N]                   │
+│  5. Update partitionedFunds for withdrawals               │
+│  6. Increment epoch counters                              │
+└────────────────┬───────────────────────────────────────────┘
+                 │
+                 ▼
+┌────────────────────────────────────────────────────────────┐
+│                 Epoch N+1 Begins                           │
+│                                                            │
+│  Users from Epoch N can: completeDeposit() / completeWithdraw()│
+│  New users: Start queuing for Epoch N+1                   │
+└────────────────────────────────────────────────────────────┘
+```
+
+## Deposit Flow
+
+### Data Structures
+
+**DepositReceipt**:
+```solidity
+struct DepositReceipt {
+    uint128 epoch;              // Epoch when deposit initiated
+    uint128 amount;             // USDC amount deposited
+    uint256 unredeemedShares;   // Shares from previous deposits not yet claimed
+}
+```
+
+**State Variables**:
+```solidity
+// Current epoch numbers
+uint256 public depositEpoch;
+
+// Price per share for each epoch
+mapping(uint256 => uint256) public depositEpochPricePerShare;
+
+// User receipts
+mapping(address => IAccounting.DepositReceipt) public depositReceipts;
+
+// Pending deposits for current epoch
+uint256 public pendingDeposits;
+```
+
+### Initiate Deposit
+
+**Function**:
+```solidity
+function deposit(uint256 amount) external whenNotPaused returns (bool)
+```
+
+**Process**:
+
+1. **Validate Amount**:
+```solidity
+require(amount > 0, "Zero amount");
+require(amount >= minDeposit, "Below minimum");
+```
+
+2. **Check Cap**:
+```solidity
+uint256 totalAssets = _getTotalAssets();
+require(totalAssets + amount <= collateralCap, "Exceeds cap");
+```
+
+3. **Transfer USDC**:
+```solidity
+SafeTransferLib.safeTransferFrom(
+    collateralAsset,
+    msg.sender,
+    address(this),
+    amount
+);
+```
+
+4. **Update or Create Receipt**:
+```solidity
+IAccounting.DepositReceipt storage receipt = depositReceipts[msg.sender];
+
+// If user has deposit from previous epoch, finalize it first
+if (receipt.amount > 0 && receipt.epoch < depositEpoch) {
+    uint256 shares = _completeDepositForReceipt(receipt);
+    receipt.unredeemedShares += shares;
+}
+
+// Add to current epoch
+receipt.epoch = uint128(depositEpoch);
+receipt.amount += uint128(amount);
+```
+
+5. **Update Pending**:
+```solidity
+pendingDeposits += amount;
+
+emit Deposit(msg.sender, amount, depositEpoch);
+```
+
+**Key Points**:
+- Deposits queued for next epoch execution
+- Users can deposit multiple times in same epoch
+- Previous unredeemed shares tracked automatically
+
+### Complete Deposit
+
+**Function**:
+```solidity
+function completeDeposit() external nonReentrant returns (uint256 shares)
+```
+
+**Process**:
+
+1. **Get Receipt**:
+```solidity
+IAccounting.DepositReceipt storage receipt = depositReceipts[msg.sender];
+require(receipt.amount > 0 || receipt.unredeemedShares > 0, "No deposit");
+```
+
+2. **Calculate Shares for Current Receipt**:
+```solidity
+if (receipt.amount > 0 && receipt.epoch < depositEpoch) {
+    // Epoch executed, calculate shares
+    uint256 pps = depositEpochPricePerShare[receipt.epoch];
+    require(pps > 0, "Epoch not executed");
+    
+    uint256 newShares = (receipt.amount * 1e18) / pps;
+    receipt.unredeemedShares += newShares;
+    receipt.amount = 0;
+}
+```
+
+3. **Mint Shares**:
+```solidity
+shares = receipt.unredeemedShares;
+require(shares > 0, "No shares to claim");
+
+receipt.unredeemedShares = 0;
+
+// Mint ERC20 shares
+_mint(msg.sender, shares);
+
+emit DepositCompleted(msg.sender, shares);
+```
+
+**Key Points**:
+- Can only complete after epoch execution
+- All accumulated shares minted at once
+- Receipt cleared after claiming
+
+### Example Deposit Scenario
+
+```solidity
+// --- Epoch 1 ---
+// User deposits 1000 USDC
+user.deposit(1000e6);
+// Receipt: { epoch: 1, amount: 1000e6, unredeemedShares: 0 }
+// pendingDeposits: 1000e6
+
+// --- Epoch 1 Execution ---
+// executeEpochCalculation() called
+// NAV: 100,000 USDC
+// Total Shares: 100,000
+// PPS: 1.0 USDC per share
+// depositEpochPricePerShare[1] = 1e6
+
+// --- Epoch 2 ---
+// User can now complete deposit
+user.completeDeposit();
+// Shares minted: 1000e6 / 1e6 = 1000 shares
+// Receipt: { epoch: 1, amount: 0, unredeemedShares: 0 }
+
+// User deposits again
+user.deposit(2000e6);
+// Receipt: { epoch: 2, amount: 2000e6, unredeemedShares: 0 }
+
+// --- Epoch 2 Execution ---
+// PPS increased to 1.1 (vault profited)
+// depositEpochPricePerShare[2] = 1.1e6
+
+// --- Epoch 3 ---
+user.completeDeposit();
+// Shares minted: 2000e6 / 1.1e6 = 1818 shares
+```
+
+## Withdrawal Flow
+
+### Data Structures
+
+**WithdrawalReceipt**:
+```solidity
+struct WithdrawalReceipt {
+    uint128 epoch;      // Epoch when withdrawal initiated
+    uint128 shares;     // Number of shares to withdraw
+}
+```
+
+**State Variables**:
+```solidity
+// Current epoch number
+uint256 public withdrawalEpoch;
+
+// Price per share for each epoch
+mapping(uint256 => uint256) public withdrawalEpochPricePerShare;
+
+// User receipts
+mapping(address => IAccounting.WithdrawalReceipt) public withdrawalReceipts;
+
+// Pending withdrawals for current epoch
+uint256 public pendingWithdrawals;
+
+// Funds set aside for pending withdrawals
+uint256 public partitionedFunds;
+```
+
+### Initiate Withdrawal
+
+**Function**:
+```solidity
+function initiateWithdraw(uint256 shares) external whenNotPaused returns (bool)
+```
+
+**Process**:
+
+1. **Validate Shares**:
+```solidity
+require(shares > 0, "Zero shares");
+require(balanceOf(msg.sender) >= shares, "Insufficient balance");
+```
+
+2. **Complete Any Pending Deposits First**:
+```solidity
+IAccounting.DepositReceipt storage depositReceipt = depositReceipts[msg.sender];
+if (depositReceipt.amount > 0 || depositReceipt.unredeemedShares > 0) {
+    completeDeposit();
+}
+```
+
+3. **Update or Create Receipt**:
+```solidity
+IAccounting.WithdrawalReceipt storage receipt = withdrawalReceipts[msg.sender];
+
+// If user has withdrawal from previous epoch, complete it first
+if (receipt.shares > 0 && receipt.epoch < withdrawalEpoch) {
+    _completeWithdrawForReceipt(receipt);
+}
+
+// Add to current epoch
+receipt.epoch = uint128(withdrawalEpoch);
+receipt.shares += uint128(shares);
+```
+
+4. **Burn Shares Immediately**:
+```solidity
+_burn(msg.sender, shares);
+```
+
+5. **Update Pending**:
+```solidity
+pendingWithdrawals += shares;
+
+emit WithdrawInitiated(msg.sender, shares, withdrawalEpoch);
+```
+
+**Key Points**:
+- Shares burned immediately (prevents double-spending)
+- USDC not transferred yet (happens at completion)
+- Multiple withdrawals in same epoch accumulate
+
+### Complete Withdrawal
+
+**Function**:
+```solidity
+function completeWithdraw() external nonReentrant returns (uint256 amount)
+```
+
+**Process**:
+
+1. **Get Receipt**:
+```solidity
+IAccounting.WithdrawalReceipt storage receipt = withdrawalReceipts[msg.sender];
+require(receipt.shares > 0, "No withdrawal");
+require(receipt.epoch < withdrawalEpoch, "Epoch not executed");
+```
+
+2. **Calculate USDC Amount**:
+```solidity
+uint256 pps = withdrawalEpochPricePerShare[receipt.epoch];
+require(pps > 0, "Epoch not executed");
+
+amount = (receipt.shares * pps) / 1e18;
+```
+
+3. **Transfer USDC**:
+```solidity
+SafeTransferLib.safeTransfer(
+    collateralAsset,
+    msg.sender,
+    amount
+);
+```
+
+4. **Update Accounting**:
+```solidity
+partitionedFunds -= amount;
+receipt.shares = 0;
+
+emit WithdrawCompleted(msg.sender, amount);
+```
+
+**Key Points**:
+- Can only complete after epoch execution
+- USDC comes from partitionedFunds (already set aside)
+- Receipt cleared after claiming
+
+### Example Withdrawal Scenario
+
+```solidity
+// --- Epoch 1 ---
+// User has 1000 shares
+// User initiates withdrawal
+user.initiateWithdraw(1000);
+// Shares burned: 1000
+// Receipt: { epoch: 1, shares: 1000 }
+// pendingWithdrawals: 1000 shares
+
+// --- Epoch 1 Execution ---
+// executeEpochCalculation() called
+// NAV: 110,000 USDC
+// Total Shares: 100,000
+// PPS: 1.1 USDC per share
+// withdrawalEpochPricePerShare[1] = 1.1e6
+// partitionedFunds += 1000 * 1.1e6 = 1100e6
+
+// --- Epoch 2 ---
+// User can now complete withdrawal
+user.completeWithdraw();
+// USDC received: 1100e6 (1100 USDC)
+// Receipt: { epoch: 1, shares: 0 }
+// partitionedFunds -= 1100e6
+```
+
+## Epoch Execution
+
+### Execute Epoch Calculation
+
+**Function**:
+```solidity
+function executeEpochCalculation() external nonReentrant
+```
+
+**Access**: Only KEEPER role
+
+**Process**:
+
+1. **Validate Timing**:
+```solidity
+uint256 minEpochDuration = 24 hours;  // Example
+require(
+    block.timestamp >= lastEpochExecution + minEpochDuration,
+    "Too soon"
+);
+```
+
+2. **Calculate NAV** (Net Asset Value):
+```solidity
+uint256 nav = _calculateNAV();
+```
+
+NAV includes:
+- Collateral balance
+- Collateral in use (locked in options)
+- Mark-to-market value of option liabilities
+- Value of hedging positions
+- Pending settlements
+
+```solidity
+function _calculateNAV() internal view returns (uint256) {
+    // Get portfolio value from feed
+    IAlphaPortfolioValuesFeed valuesFeed = IAlphaPortfolioValuesFeed(
+        protocol.portfolioValuesFeed()
+    );
+    
+    int256 portfolioValue = valuesFeed.getPortfolioValues(
+        underlyingAsset,
+        strikeAsset
+    );
+    
+    // Subtract partitioned funds (already committed to withdrawals)
+    int256 availableValue = portfolioValue - int256(partitionedFunds);
+    
+    return uint256(availableValue);
+}
+```
+
+3. **Calculate Deposit PPS**:
+```solidity
+uint256 totalSharesBeforeDeposits = totalSupply();
+
+if (pendingDeposits > 0) {
+    // Price per share for depositors
+    uint256 depositPPS = totalSharesBeforeDeposits > 0
+        ? (nav * 1e18) / totalSharesBeforeDeposits
+        : 1e6;  // Initial PPS = 1 USDC per share
+    
+    depositEpochPricePerShare[depositEpoch] = depositPPS;
+    
+    // Add deposits to NAV
+    nav += pendingDeposits;
+    
+    emit DepositEpochExecuted(depositEpoch, depositPPS, pendingDeposits);
+}
+```
+
+4. **Calculate Withdrawal PPS**:
+```solidity
+if (pendingWithdrawals > 0) {
+    uint256 totalSharesAfterDeposits = totalSharesBeforeDeposits
+        + (pendingDeposits * 1e18) / depositEpochPricePerShare[depositEpoch];
+    
+    // Price per share for withdrawers
+    uint256 withdrawalPPS = (nav * 1e18) / totalSharesAfterDeposits;
+    
+    withdrawalEpochPricePerShare[withdrawalEpoch] = withdrawalPPS;
+    
+    // Set aside funds for withdrawals
+    uint256 withdrawalAmount = (pendingWithdrawals * withdrawalPPS) / 1e18;
+    partitionedFunds += withdrawalAmount;
+    
+    emit WithdrawalEpochExecuted(withdrawalEpoch, withdrawalPPS, pendingWithdrawals);
+}
+```
+
+5. **Check Liquidity for Withdrawals**:
+```solidity
+uint256 liquidBalance = IERC20(collateralAsset).balanceOf(address(this))
+    - partitionedFunds  // Exclude committed funds
+    - pendingDeposits;  // Exclude pending deposits
+
+require(
+    liquidBalance >= withdrawalAmount,
+    "Insufficient liquidity"
+);
+```
+
+If insufficient liquidity:
+```solidity
+// Need to free collateral
+// Option 1: Close option positions
+// Option 2: Close hedging positions
+// Option 3: Wait for option expirations
+// Option 4: Partial withdrawals (if allowed)
+```
+
+6. **Increment Epochs**:
+```solidity
+depositEpoch++;
+withdrawalEpoch++;
+pendingDeposits = 0;
+pendingWithdrawals = 0;
+lastEpochExecution = block.timestamp;
+
+emit EpochExecuted(
+    depositEpoch - 1,
+    withdrawalEpoch - 1,
+    nav,
+    block.timestamp
+);
+```
+
+### Epoch Execution Example
+
+```solidity
+// --- Before Execution ---
+// NAV: 100,000 USDC
+// Total Shares: 100,000
+// Pending Deposits: 10,000 USDC
+// Pending Withdrawals: 5,000 shares
+
+// --- Execution ---
+executeEpochCalculation();
+
+// Step 1: Calculate deposit PPS
+// depositPPS = 100,000 / 100,000 = 1.0 USDC
+// depositEpochPricePerShare[N] = 1e6
+
+// Step 2: Add deposits to NAV
+// NAV = 100,000 + 10,000 = 110,000 USDC
+
+// Step 3: Calculate total shares after deposits
+// New shares from deposits = 10,000 / 1.0 = 10,000
+// Total shares = 100,000 + 10,000 = 110,000
+
+// Step 4: Calculate withdrawal PPS
+// withdrawalPPS = 110,000 / 110,000 = 1.0 USDC
+// withdrawalEpochPricePerShare[N] = 1e6
+
+// Step 5: Set aside withdrawal funds
+// withdrawalAmount = 5,000 * 1.0 = 5,000 USDC
+// partitionedFunds = 5,000 USDC
+
+// Step 6: Check liquidity
+// Balance: 110,000 USDC
+// Liquid: 110,000 - 5,000 (partitioned) = 105,000 USDC
+// Required: 5,000 USDC
+// ✓ Sufficient
+
+// --- After Execution ---
+// depositEpoch++
+// withdrawalEpoch++
+// pendingDeposits = 0
+// pendingWithdrawals = 0
+```
+
+## Accounting System
+
+### Balance Tracking
+
+**Key Functions**:
+
+**Get Balance** (excluding partitioned funds):
+```solidity
+function getBalance(address asset) public view returns (uint256)
+```
+
+```solidity
+if (asset == collateralAsset) {
+    uint256 totalBalance = IERC20(asset).balanceOf(address(this));
+    return totalBalance > partitionedFunds
+        ? totalBalance - partitionedFunds
+        : 0;
+} else {
+    return IERC20(asset).balanceOf(address(this));
+}
+```
+
+**Get Total Assets**:
+```solidity
+function _getTotalAssets() internal view returns (uint256)
+```
+
+```solidity
+return getBalance(collateralAsset)  // Free collateral
+    + collateralAllocated            // Locked in options
+    + _getHedgingValue();            // Value in hedging reactors
+```
+
+### Collateral Allocation
+
+**When Writing Options**:
+```solidity
+function handlerWriteOption(...) external returns (uint256) {
+    // Calculate collateral needed
+    uint256 collateralRequired = _calculateCollateralRequired(
+        optionSeries,
+        amount
+    );
+    
+    // Check available collateral
+    uint256 availableCollateral = _getAvailableCollateral();
+    require(availableCollateral >= collateralRequired, "Insufficient");
+    
+    // Allocate collateral
+    collateralAllocated += collateralRequired;
+    
+    // Update liabilities
+    ephemeralLiabilities += int256(premium);
+    
+    // Update delta
+    ephemeralDelta += delta;
+    
+    ...
+}
+```
+
+**When Closing Options**:
+```solidity
+function handlerBuybackOption(...) external returns (uint256) {
+    // Free collateral
+    collateralAllocated -= collateralAmount;
+    
+    // Update liabilities
+    ephemeralLiabilities -= int256(premium);
+    
+    // Update delta
+    ephemeralDelta -= delta;
+    
+    ...
+}
+```
+
+### Available Collateral Calculation
+
+**Function**:
+```solidity
+function _getAvailableCollateral() internal view returns (uint256)
+```
+
+```solidity
+uint256 totalCollateral = getBalance(collateralAsset);
+
+// Apply buffer (e.g., 50% = keep 50% free)
+uint256 usableCollateral = (totalCollateral * (10000 - bufferPercentage)) / 10000;
+
+// Subtract already allocated
+uint256 available = usableCollateral > collateralAllocated
+    ? usableCollateral - collateralAllocated
+    : 0;
+
+return available;
+```
+
+**Example**:
+```solidity
+// Total collateral: 100,000 USDC
+// Buffer: 50%
+// Already allocated: 30,000 USDC
+
+// Usable: 100,000 * 50% = 50,000 USDC
+// Available: 50,000 - 30,000 = 20,000 USDC
+// Can write options requiring up to 20,000 USDC collateral
+```
+
+### Delta Tracking
+
+**Current Delta**:
+```solidity
+int256 public ephemeralDelta;
+```
+
+**Updated when**:
+- Writing options (add option delta)
+- Closing options (remove option delta)
+- Hedging (add hedge delta)
+
+**Example**:
+```solidity
+// Sell 10 ATM calls (delta ≈ -0.5 each)
+// ephemeralDelta += -5 ETH
+
+// Hedge by buying 5 ETH on Uniswap
+// ephemeralDelta += +5 ETH
+
+// Net delta: 0 (delta neutral)
+```
+
+### Liabilities Tracking
+
+**Current Liabilities**:
+```solidity
+int256 public ephemeralLiabilities;
+```
+
+Represents mark-to-market value of all option obligations:
+
+```solidity
+// Sold call worth $100 (liability)
+ephemeralLiabilities += 100e6;
+
+// Call now worth $150 (increased liability)
+ephemeralLiabilities += 50e6;
+
+// Close position (remove liability)
+ephemeralLiabilities -= 150e6;
+```
+
+## Operational Procedures
+
+### Daily Operations
+
+**1. Monitor Epoch Timing**:
+```typescript
+if (currentTime > lastEpochTime + epochDuration) {
+    await liquidityPool.executeEpochCalculation();
+}
+```
+
+**2. Monitor Delta Exposure**:
+```typescript
+const delta = await liquidityPool.ephemeralDelta();
+const threshold = 5e18;  // 5 ETH
+
+if (Math.abs(delta) > threshold) {
+    await liquidityPool.rebalancePortfolioDelta(-delta, reactorIndex);
+}
+```
+
+**3. Check Collateral Usage**:
+```typescript
+const allocated = await liquidityPool.collateralAllocated();
+const total = await liquidityPool.getBalance(USDC);
+const utilizationRate = allocated / total;
+
+if (utilizationRate > 0.8) {
+    // High utilization, reduce new option writing
+    await liquidityPool.setBufferPercentage(6000);  // Increase buffer
+}
+```
+
+**4. Monitor Hedging Reactors**:
+```typescript
+for (const reactor of hedgingReactors) {
+    const health = await reactor.checkHealth();
+    if (!health) {
+        await reactor.rebalanceMargin();
+    }
+}
+```
+
+### Emergency Procedures
+
+**Pause Trading**:
+```solidity
+function pause() external onlyManager {
+    _pause();
+    isTradingPaused = true;
+}
+```
+
+**Unpause**:
+```solidity
+function unpause() external onlyManager {
+    _unpause();
+    isTradingPaused = false;
+}
+```
+
+**Emergency Withdraw** (from hedging reactor):
+```solidity
+function emergencyWithdrawFromReactor(
+    uint256 reactorIndex,
+    uint256 amount
+) external onlyManager {
+    IHedgingReactor reactor = IHedgingReactor(hedgingReactors[reactorIndex]);
+    reactor.withdraw(amount);
+}
+```
+
+---
+
+**Key Takeaways**:
+- ✅ Epoch system ensures fair pricing for all users
+- ✅ Two-step deposit/withdrawal prevents front-running
+- ✅ Partitioned funds guarantee withdrawal availability
+- ✅ Real-time collateral tracking prevents over-commitment
+- ✅ Delta and liability tracking enable risk management
+- ✅ Keeper-driven automation ensures smooth operations

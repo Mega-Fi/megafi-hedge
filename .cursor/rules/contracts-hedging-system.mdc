@@ -1,0 +1,866 @@
+---
+alwaysApply: false
+---
+# Hedging Reactors & Delta Management
+
+Technical documentation for the hedging reactor system that enables the Dynamic Hedging Vault to maintain delta-neutral positions across multiple DeFi protocols.
+
+## Hedging System Overview
+
+### Purpose
+
+The DHV (Dynamic Hedging Vault) sells options to users, which creates directional exposure (delta). To maintain delta-neutral positions and generate uncorrelated returns, the vault must hedge this exposure using other derivatives.
+
+### Architecture
+
+```
+                    LiquidityPool
+                         │
+                         │ ephemeralDelta
+                         │
+        ┌────────────────┼────────────────┐
+        │                │                │
+        ▼                ▼                ▼
+UniswapV3Reactor  PerpHedgingReactor  GmxHedgingReactor
+        │                │                │
+        ▼                ▼                ▼
+   Uniswap V3      Rage Trade         GMX Protocol
+  (Spot Trading)   (Perp Futures)   (Perp Futures)
+```
+
+### IHedgingReactor Interface
+
+All hedging reactors implement this standard interface:
+
+```solidity
+interface IHedgingReactor {
+    // Execute hedge trade to adjust delta
+    function hedgeDelta(int256 delta) external returns (int256);
+    
+    // Get current delta exposure in this reactor
+    function getDelta() external view returns (int256);
+    
+    // Get value of positions in this reactor (in pool's denomination)
+    function getPoolDenominatedValue() external view returns (uint256);
+    
+    // Sync positions and update accounting
+    function update() external returns (uint256);
+    
+    // Withdraw funds back to pool
+    function withdraw(uint256 amount) external returns (uint256);
+    
+    // Get assets held by reactor
+    function getAssets() external view returns (address[] memory);
+}
+```
+
+## UniswapV3HedgingReactor.sol - Spot Hedging
+
+### Overview
+
+Hedges delta exposure by trading spot tokens on Uniswap V3. Most direct form of hedging but requires capital for full collateralization.
+
+### Contract Structure
+
+```solidity
+contract UniswapV3HedgingReactor is ReentrancyGuard, AccessControl, IHedgingReactor
+```
+
+### State Variables
+
+```solidity
+// Core references
+ILiquidityPool public immutable liquidityPool;
+Protocol public immutable protocol;
+
+// Uniswap integration
+ISwapRouter public immutable swapRouter;
+address public immutable underlying;      // WETH
+address public immutable strikeAsset;     // USDC
+uint24 public poolFee;                    // e.g., 3000 = 0.3%
+
+// Position tracking
+int256 public hedgeDelta;                 // Current delta hedge
+uint256 public underlyingBalance;         // WETH held
+uint256 public strikeAssetBalance;        // USDC held
+
+// Risk parameters
+uint256 public maxTradeSize;              // Max per trade
+uint256 public slippageTolerance;         // Acceptable slippage (e.g., 100 = 1%)
+```
+
+### Core Functions
+
+**Execute Delta Hedge**:
+```solidity
+function hedgeDelta(int256 delta) external override nonReentrant returns (int256)
+```
+
+**Logic**:
+
+1. **Validate Caller**:
+```solidity
+require(msg.sender == address(liquidityPool), "Only pool");
+```
+
+2. **Determine Trade Direction**:
+```solidity
+bool isBuy = delta > 0;  // Positive delta = need to buy underlying
+uint256 amount = uint256(delta > 0 ? delta : -delta);
+```
+
+3. **Check Trade Size**:
+```solidity
+require(amount <= maxTradeSize, "Exceeds max");
+```
+
+4. **Execute Swap**:
+```solidity
+if (isBuy) {
+    // Buy WETH with USDC
+    uint256 amountOut = _swapExactInput(
+        strikeAsset,      // USDC in
+        underlying,       // WETH out
+        poolFee,
+        amount,           // Amount of USDC to spend
+        _calculateMinOut(amount, true)  // Slippage protection
+    );
+    
+    underlyingBalance += amountOut;
+    hedgeDelta += int256(amountOut);
+} else {
+    // Sell WETH for USDC
+    uint256 amountOut = _swapExactInput(
+        underlying,       // WETH in
+        strikeAsset,      // USDC out
+        poolFee,
+        amount,           // Amount of WETH to sell
+        _calculateMinOut(amount, false)
+    );
+    
+    strikeAssetBalance += amountOut;
+    hedgeDelta -= int256(amount);
+}
+```
+
+5. **Emit Event**:
+```solidity
+emit HedgeExecuted(delta, hedgeDelta, block.timestamp);
+```
+
+6. **Return New Delta**:
+```solidity
+return hedgeDelta;
+```
+
+**Swap Execution**:
+```solidity
+function _swapExactInput(
+    address tokenIn,
+    address tokenOut,
+    uint24 fee,
+    uint256 amountIn,
+    uint256 amountOutMinimum
+) internal returns (uint256 amountOut)
+```
+
+Uses Uniswap V3 Router:
+```solidity
+ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
+    tokenIn: tokenIn,
+    tokenOut: tokenOut,
+    fee: fee,
+    recipient: address(this),
+    deadline: block.timestamp,
+    amountIn: amountIn,
+    amountOutMinimum: amountOutMinimum,
+    sqrtPriceLimitX96: 0  // No price limit
+});
+
+amountOut = swapRouter.exactInputSingle(params);
+```
+
+**Calculate Minimum Output** (slippage protection):
+```solidity
+function _calculateMinOut(
+    uint256 amountIn,
+    bool isBuyingUnderlying
+) internal view returns (uint256 minOut)
+```
+
+```solidity
+// Get current spot price
+uint256 spotPrice = _getSpotPrice();
+
+// Calculate expected output
+uint256 expectedOut = isBuyingUnderlying
+    ? (amountIn * 1e18) / spotPrice  // USDC → WETH
+    : (amountIn * spotPrice) / 1e18; // WETH → USDC
+
+// Apply slippage tolerance
+minOut = (expectedOut * (10000 - slippageTolerance)) / 10000;
+```
+
+**Get Current Delta**:
+```solidity
+function getDelta() external view override returns (int256)
+```
+
+```solidity
+return hedgeDelta;
+```
+
+**Get Value**:
+```solidity
+function getPoolDenominatedValue() external view override returns (uint256)
+```
+
+```solidity
+// Value of WETH held + USDC held
+uint256 underlyingPrice = _getUnderlyingPrice();
+uint256 underlyingValue = (underlyingBalance * underlyingPrice) / 1e18;
+
+return underlyingValue + strikeAssetBalance;
+```
+
+**Withdraw to Pool**:
+```solidity
+function withdraw(uint256 amount) external override returns (uint256)
+```
+
+```solidity
+require(msg.sender == address(liquidityPool), "Only pool");
+require(strikeAssetBalance >= amount, "Insufficient balance");
+
+strikeAssetBalance -= amount;
+SafeTransferLib.safeTransfer(strikeAsset, address(liquidityPool), amount);
+
+return amount;
+```
+
+**Update Positions**:
+```solidity
+function update() external override returns (uint256)
+```
+
+```solidity
+// Sync balances with actual token holdings
+uint256 actualUnderlying = IERC20(underlying).balanceOf(address(this));
+uint256 actualStrike = IERC20(strikeAsset).balanceOf(address(this));
+
+underlyingBalance = actualUnderlying;
+strikeAssetBalance = actualStrike;
+
+return getPoolDenominatedValue();
+```
+
+### Advantages & Disadvantages
+
+**Advantages**:
+- ✅ Most direct hedge (actual spot tokens)
+- ✅ No funding rate costs
+- ✅ No liquidation risk
+- ✅ Deep liquidity on Uniswap V3
+
+**Disadvantages**:
+- ❌ Capital intensive (need full collateral)
+- ❌ Gas costs for frequent rebalancing
+- ❌ Slippage on large trades
+- ❌ Opportunity cost of locked capital
+
+## PerpHedgingReactor.sol - Perpetual Futures via Rage Trade
+
+### Overview
+
+Hedges delta using perpetual futures on Rage Trade. More capital efficient than spot hedging due to leverage.
+
+### Contract Structure
+
+```solidity
+contract PerpHedgingReactor is ReentrancyGuard, AccessControl, IHedgingReactor
+```
+
+### State Variables
+
+```solidity
+// Core references
+ILiquidityPool public immutable liquidityPool;
+Protocol public immutable protocol;
+
+// Rage Trade integration
+IClearingHouse public clearingHouse;
+IVToken public vToken;                    // Virtual token representing perp position
+uint256 public accountId;                  // Rage Trade account ID
+
+// Position tracking
+int256 public perpPosition;                // Current perp position size (signed)
+int256 public positionDelta;               // Delta of perp position
+uint256 public collateralDeposited;        // USDC deposited as margin
+
+// Risk parameters
+uint256 public maxLeverage;                // e.g., 10 = 10x
+uint256 public minMarginRatio;             // e.g., 1500 = 15%
+uint256 public targetLeverage;             // e.g., 5 = 5x
+```
+
+### Core Functions
+
+**Execute Delta Hedge**:
+```solidity
+function hedgeDelta(int256 delta) external override nonReentrant returns (int256)
+```
+
+**Logic**:
+
+1. **Validate Caller**:
+```solidity
+require(msg.sender == address(liquidityPool), "Only pool");
+```
+
+2. **Calculate Trade Size**:
+```solidity
+// Target position after hedge
+int256 targetPosition = positionDelta + delta;
+
+// Amount to trade = difference
+int256 tradeAmount = targetPosition - perpPosition;
+```
+
+3. **Check Margin Requirements**:
+```solidity
+uint256 requiredMargin = _calculateRequiredMargin(
+    uint256(tradeAmount > 0 ? tradeAmount : -tradeAmount)
+);
+
+if (collateralDeposited < requiredMargin) {
+    // Request more collateral from pool
+    uint256 additionalMargin = requiredMargin - collateralDeposited;
+    _requestCollateral(additionalMargin);
+}
+```
+
+4. **Execute Perp Trade**:
+```solidity
+IClearingHouse.SwapParams memory swapParams = IClearingHouse.SwapParams({
+    amount: tradeAmount,
+    sqrtPriceLimit: 0,
+    isNotional: false,    // Trade by base token amount
+    isPartialAllowed: false,
+    settleProfit: false
+});
+
+(int256 vTokenAmount, int256 vQuoteAmount) = clearingHouse.swapToken(
+    accountId,
+    address(vToken),
+    swapParams
+);
+```
+
+5. **Update Position Tracking**:
+```solidity
+perpPosition += vTokenAmount;
+positionDelta = perpPosition;  // Perp position directly maps to delta
+
+emit HedgeExecuted(delta, positionDelta, block.timestamp);
+```
+
+6. **Return New Delta**:
+```solidity
+return positionDelta;
+```
+
+**Request Collateral from Pool**:
+```solidity
+function _requestCollateral(uint256 amount) internal
+```
+
+```solidity
+// Pool transfers USDC to reactor
+liquidityPool.transferFundsForHedge(amount);
+
+// Deposit to Rage Trade
+clearingHouse.updateMargin(
+    accountId,
+    int256(amount)  // Positive = deposit
+);
+
+collateralDeposited += amount;
+```
+
+**Calculate Required Margin**:
+```solidity
+function _calculateRequiredMargin(uint256 notional) internal view returns (uint256)
+```
+
+```solidity
+// Margin = Notional / Target Leverage
+// Add buffer for price movements
+uint256 baseMargin = (notional * 1e18) / (targetLeverage * 1e18);
+uint256 buffer = (baseMargin * (minMarginRatio - 1000)) / 1000;  // Extra buffer
+
+return baseMargin + buffer;
+```
+
+**Monitor Health**:
+```solidity
+function checkHealth() public view returns (bool isHealthy, uint256 marginRatio)
+```
+
+```solidity
+// Get account value from Rage Trade
+(int256 accountValue, int256 totalRequired) = clearingHouse.getAccountNetProfit(accountId);
+
+if (totalRequired > 0) {
+    marginRatio = uint256(accountValue * 10000 / totalRequired);
+    isHealthy = marginRatio > minMarginRatio;
+} else {
+    isHealthy = true;
+    marginRatio = type(uint256).max;
+}
+```
+
+**Rebalance Margin** (if needed):
+```solidity
+function rebalanceMargin() external
+```
+
+```solidity
+(bool isHealthy, uint256 marginRatio) = checkHealth();
+
+if (!isHealthy) {
+    // Add more margin
+    uint256 additionalMargin = _calculateAdditionalMarginNeeded();
+    _requestCollateral(additionalMargin);
+} else if (marginRatio > targetLeverage * 2) {
+    // Withdraw excess margin back to pool
+    uint256 excessMargin = _calculateExcessMargin();
+    _withdrawMargin(excessMargin);
+}
+```
+
+**Settle Funding**:
+```solidity
+function settleFunding() external
+```
+
+```solidity
+// Rage Trade: Settle funding payments
+clearingHouse.updateProfit(accountId);
+
+// Get realized PnL
+int256 realizedPnL = clearingHouse.getAccountNetProfit(accountId);
+
+// Update accounting
+if (realizedPnL > 0) {
+    // Profit: can withdraw back to pool
+    emit FundingReceived(uint256(realizedPnL));
+} else {
+    // Loss: may need to add margin
+    emit FundingPaid(uint256(-realizedPnL));
+}
+```
+
+**Get Delta**:
+```solidity
+function getDelta() external view override returns (int256)
+```
+
+```solidity
+return positionDelta;
+```
+
+**Get Value**:
+```solidity
+function getPoolDenominatedValue() external view override returns (uint256)
+```
+
+```solidity
+// Get mark-to-market value from Rage Trade
+(int256 accountValue, ) = clearingHouse.getAccountNetProfit(accountId);
+
+// Return as unsigned (assuming net positive after collateral)
+return accountValue > 0 ? uint256(accountValue) : 0;
+```
+
+### Advantages & Disadvantages
+
+**Advantages**:
+- ✅ Capital efficient (leverage)
+- ✅ Lower gas costs (fewer on-chain operations)
+- ✅ Can achieve large positions with less capital
+- ✅ No slippage on rebalancing collateral
+
+**Disadvantages**:
+- ❌ Funding rate costs (can be positive or negative)
+- ❌ Liquidation risk if under-collateralized
+- ❌ Complexity of managing margin
+- ❌ Dependent on Rage Trade protocol health
+
+## GmxHedgingReactor.sol - Perpetual Futures via GMX
+
+### Overview
+
+Hedges delta using GMX perpetual futures. Similar to Rage Trade reactor but integrates with GMX protocol.
+
+### Contract Structure
+
+```solidity
+contract GmxHedgingReactor is ReentrancyGuard, AccessControl, IHedgingReactor
+```
+
+### State Variables
+
+```solidity
+// Core references
+ILiquidityPool public immutable liquidityPool;
+Protocol public immutable protocol;
+
+// GMX integration
+IRouter public gmxRouter;
+IPositionRouter public positionRouter;
+IVault public gmxVault;
+address public immutable collateralToken;   // USDC
+address public immutable indexToken;        // WETH
+
+// Position tracking
+bytes32 public positionKey;                 // GMX position identifier
+int256 public positionSize;                 // Long = positive, Short = negative
+int256 public positionDelta;
+uint256 public collateralInPosition;
+
+// Execution parameters
+uint256 public executionFee;                // Fee for keepers
+uint256 public acceptableSlippage;          // Slippage tolerance
+```
+
+### Core Functions
+
+**Execute Delta Hedge**:
+```solidity
+function hedgeDelta(int256 delta) external override nonReentrant returns (int256)
+```
+
+**Logic** (similar to Perp reactor but GMX-specific):
+
+1. **Determine Trade Direction and Size**:
+```solidity
+bool isLong = delta > 0;
+uint256 sizeDelta = uint256(delta > 0 ? delta : -delta);
+```
+
+2. **Check Existing Position**:
+```solidity
+(
+    uint256 currentSize,
+    uint256 currentCollateral,
+    uint256 averagePrice,
+    ,
+    ,
+    ,
+    bool hasProfit,
+    uint256 delta
+) = gmxVault.getPosition(
+    address(this),
+    collateralToken,
+    indexToken,
+    isLong
+);
+```
+
+3. **Calculate Collateral Needed**:
+```solidity
+uint256 leverage = 10;  // 10x leverage
+uint256 collateralNeeded = sizeDelta / leverage;
+
+// Add buffer for price movements
+collateralNeeded = (collateralNeeded * 12) / 10;  // 20% buffer
+```
+
+4. **Increase Position**:
+```solidity
+if (sizeDelta > currentSize) {
+    // Need to increase position
+    uint256 increaseAmount = sizeDelta - currentSize;
+    
+    // Create increase position request
+    positionRouter.createIncreasePosition{value: executionFee}(
+        [collateralToken],              // Path
+        indexToken,                     // Index token
+        collateralNeeded,               // Collateral to add
+        0,                              // Min out (0 for increase)
+        increaseAmount,                 // Size delta
+        isLong,                         // Long or short
+        _calculateAcceptablePrice(isLong),  // Acceptable execution price
+        executionFee,                   // Execution fee
+        referralCode                    // Referral code
+    );
+}
+```
+
+5. **Decrease Position** (if needed):
+```solidity
+else if (sizeDelta < currentSize) {
+    uint256 decreaseAmount = currentSize - sizeDelta;
+    
+    positionRouter.createDecreasePosition{value: executionFee}(
+        [collateralToken],
+        indexToken,
+        decreaseAmount,                 // Collateral to remove
+        decreaseAmount,                 // Size delta
+        isLong,
+        address(this),                  // Receiver
+        _calculateAcceptablePrice(isLong),
+        0,                              // Min out
+        executionFee,
+        false                           // Not withdrawing ETH
+    );
+}
+```
+
+6. **Update Position Tracking**:
+```solidity
+positionSize = isLong ? int256(sizeDelta) : -int256(sizeDelta);
+positionDelta = positionSize;
+
+emit HedgeExecuted(delta, positionDelta, block.timestamp);
+```
+
+**Calculate Acceptable Price**:
+```solidity
+function _calculateAcceptablePrice(bool isLong) internal view returns (uint256)
+```
+
+```solidity
+uint256 currentPrice = _getIndexPrice();
+
+if (isLong) {
+    // Buying: accept up to X% higher
+    return (currentPrice * (10000 + acceptableSlippage)) / 10000;
+} else {
+    // Selling: accept up to X% lower
+    return (currentPrice * (10000 - acceptableSlippage)) / 10000;
+}
+```
+
+**Handle Execution Callback**:
+```solidity
+function gmxPositionCallback(
+    bytes32 positionId,
+    bool isExecuted,
+    bool isIncrease
+) external
+```
+
+Called by GMX after position is executed:
+
+```solidity
+require(msg.sender == address(positionRouter), "Only position router");
+
+if (isExecuted) {
+    // Update position tracking
+    _syncPosition();
+    
+    emit PositionExecuted(positionId, isIncrease);
+} else {
+    // Execution failed (e.g., price moved too much)
+    emit PositionFailed(positionId, isIncrease);
+}
+```
+
+**Sync Position State**:
+```solidity
+function _syncPosition() internal
+```
+
+```solidity
+// Get current position from GMX
+(uint256 size, uint256 collateral, , , , , , ) = gmxVault.getPosition(
+    address(this),
+    collateralToken,
+    indexToken,
+    positionSize > 0  // isLong
+);
+
+// Update tracking
+if (positionSize > 0) {
+    positionSize = int256(size);
+} else {
+    positionSize = -int256(size);
+}
+
+collateralInPosition = collateral;
+positionDelta = positionSize;
+```
+
+**Get Position PnL**:
+```solidity
+function getPositionPnL() public view returns (int256 pnl, bool hasProfit)
+```
+
+```solidity
+bool isLong = positionSize > 0;
+
+(, , , , , , hasProfit, uint256 delta) = gmxVault.getPosition(
+    address(this),
+    collateralToken,
+    indexToken,
+    isLong
+);
+
+pnl = hasProfit ? int256(delta) : -int256(delta);
+```
+
+### GMX-Specific Considerations
+
+**Execution Fees**:
+- GMX uses keeper network for execution
+- Must pay execution fee (typically 0.0001-0.001 ETH)
+- Fee returned if execution fails
+
+**Price Impact**:
+- GMX has built-in price impact based on pool imbalance
+- Large trades may have significant impact
+- Check `gmxVault.getPositionFee()` before trading
+
+**Funding Rates**:
+- GMX charges hourly funding based on long/short imbalance
+- Can be positive or negative
+- Check `gmxVault.getFundingRate()` for current rate
+
+## Hedging Strategy Coordinator
+
+### When to Use Each Reactor
+
+**Uniswap V3 Spot**:
+- Small to medium hedges (< $100k)
+- When immediate execution required
+- When funding rates on perps are unfavorable
+- When leverage not needed
+
+**Rage Trade Perps**:
+- Medium to large hedges (> $100k)
+- When capital efficiency important
+- When willing to pay funding rates
+- When leverage beneficial
+
+**GMX Perps**:
+- Large hedges with price impact concerns
+- When GMX has better funding rates
+- When execution time less critical (async execution)
+- Alternative to Rage Trade for diversification
+
+### Multi-Reactor Hedging
+
+LiquidityPool can use multiple reactors simultaneously:
+
+```solidity
+function rebalancePortfolioDelta(int256 targetDelta, uint256 reactorIndex) external
+```
+
+**Example Strategy**:
+```solidity
+// Current pool delta: +50 ETH (too long)
+// Target: 0 (delta neutral)
+// Need to hedge: -50 ETH (go short 50 ETH)
+
+// Split across reactors:
+// - Uniswap: -20 ETH (spot sell)
+// - Rage Trade: -20 ETH (perp short)
+// - GMX: -10 ETH (perp short)
+
+liquidityPool.rebalancePortfolioDelta(-20e18, 0);  // Uniswap reactor
+liquidityPool.rebalancePortfolioDelta(-20e18, 1);  // Rage reactor
+liquidityPool.rebalancePortfolioDelta(-10e18, 2);  // GMX reactor
+```
+
+**Benefits of Multi-Reactor**:
+- ✅ Risk diversification (not dependent on single protocol)
+- ✅ Better execution (split large trades)
+- ✅ Optimize for different market conditions
+- ✅ Reduce concentration risk
+
+## Hedging Reactor Management
+
+### Adding New Reactor
+
+```solidity
+// In LiquidityPool.sol
+function addHedgingReactor(address reactor) external onlyManager
+```
+
+```solidity
+require(reactor != address(0), "Invalid address");
+require(
+    IHedgingReactor(reactor).liquidityPool() == address(this),
+    "Wrong pool"
+);
+
+hedgingReactors.push(reactor);
+
+emit HedgingReactorAdded(reactor);
+```
+
+### Removing Reactor
+
+```solidity
+function removeHedgingReactor(uint256 index) external onlyManager
+```
+
+```solidity
+require(index < hedgingReactors.length, "Invalid index");
+
+address reactor = hedgingReactors[index];
+
+// Ensure reactor has no open positions
+require(
+    IHedgingReactor(reactor).getDelta() == 0,
+    "Reactor has positions"
+);
+
+// Withdraw all funds
+uint256 balance = IHedgingReactor(reactor).getPoolDenominatedValue();
+if (balance > 0) {
+    IHedgingReactor(reactor).withdraw(balance);
+}
+
+// Remove from array
+hedgingReactors[index] = hedgingReactors[hedgingReactors.length - 1];
+hedgingReactors.pop();
+
+emit HedgingReactorRemoved(reactor);
+```
+
+### Health Monitoring
+
+Automated keeper script monitors reactor health:
+
+```typescript
+async function monitorReactorHealth() {
+  for (const reactor of hedgingReactors) {
+    // Check margin ratio for perp reactors
+    const isHealthy = await reactor.checkHealth();
+    
+    if (!isHealthy) {
+      // Alert or auto-rebalance
+      await reactor.rebalanceMargin();
+    }
+    
+    // Check funding rates
+    const fundingRate = await reactor.getFundingRate();
+    if (Math.abs(fundingRate) > 0.01) {
+      // Consider rebalancing to different reactor
+      console.log(`High funding rate on ${reactor}: ${fundingRate}`);
+    }
+  }
+}
+```
+
+---
+
+**Key Takeaways**:
+- ✅ Hedging reactors enable delta-neutral vault operation
+- ✅ Multiple reactor types for different market conditions
+- ✅ Capital efficient perpetual futures reduce lock-up
+- ✅ Spot hedging provides direct, risk-free alternative
+- ✅ Multi-reactor strategy diversifies protocol risk
+- ✅ Automated monitoring ensures position health

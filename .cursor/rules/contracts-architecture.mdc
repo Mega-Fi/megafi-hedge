@@ -1,0 +1,551 @@
+---
+alwaysApply: false
+---
+# Smart Contracts Architecture
+
+Deep technical documentation of the MegaFi Hedge smart contracts architecture, component relationships, and system design patterns.
+
+## System Overview
+
+MegaFi Hedge is built on a modular architecture with clear separation of concerns:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    User Interfaces                       │
+│  ┌──────────────────┐      ┌──────────────────┐        │
+│  │  OptionExchange  │      │ AlphaOptionHandler│        │
+│  │  (Public Trading)│      │   (OTC Orders)    │        │
+│  └────────┬─────────┘      └────────┬──────────┘        │
+└───────────┼──────────────────────────┼───────────────────┘
+            │                          │
+            └──────────┬───────────────┘
+                       │
+┌──────────────────────▼──────────────────────────────────┐
+│                  LiquidityPool                          │
+│         (Core DHV - Dynamic Hedging Vault)              │
+│                                                          │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐    │
+│  │  Deposits   │  │  Withdrawals│  │   Options   │    │
+│  │  & Shares   │  │  & Epochs   │  │   Writing   │    │
+│  └─────────────┘  └─────────────┘  └─────────────┘    │
+└──────────┬───────────────────────────────┬──────────────┘
+           │                               │
+           │      ┌────────────────────────┼────────────┐
+           │      │                        │            │
+┌──────────▼──────▼───┐      ┌─────────────▼─────┐  ┌──▼──────────┐
+│  OptionRegistry     │      │  HedgingReactors  │  │  BeyondPricer│
+│  (Opyn Integration) │      │ (Delta Hedging)   │  │  (Pricing)   │
+└──────────┬──────────┘      └───────────────────┘  └──┬───────────┘
+           │                                            │
+┌──────────▼──────────┐      ┌────────────────────────▼────────────┐
+│   Gamma Protocol    │      │    Oracles & Feeds                   │
+│   (Option Tokens)   │      │  ┌──────────┐  ┌──────────────────┐ │
+└─────────────────────┘      │  │PriceFeed │  │VolatilityFeed    │ │
+                             │  └──────────┘  └──────────────────┘ │
+                             │  ┌────────────────────────────────┐ │
+                             │  │AlphaPortfolioValuesFeed        │ │
+                             │  └────────────────────────────────┘ │
+                             └─────────────────────────────────────┘
+```
+
+## Core Contracts
+
+### 1. LiquidityPool.sol
+
+**Purpose**: The Dynamic Hedging Vault - main contract for liquidity provision and options issuance.
+
+**Key Responsibilities**:
+- Manages USDC deposits and withdrawals via epoch system
+- Issues and manages ERC20 shares representing vault ownership
+- Writes and manages options positions
+- Coordinates delta hedging through hedging reactors
+- Maintains collateral allocation and accounting
+- Enforces risk limits and buffers
+
+**Inheritance**:
+```solidity
+contract LiquidityPool is ERC20, AccessControl, ReentrancyGuard, Pausable
+```
+
+**Critical State Variables**:
+```solidity
+// Assets
+address public immutable strikeAsset;        // USDC
+address public immutable underlyingAsset;    // WETH
+address public immutable collateralAsset;    // USDC
+
+// Accounting
+uint256 public collateralAllocated;          // Collateral in use
+int256 public ephemeralLiabilities;          // Current liabilities
+int256 public ephemeralDelta;                // Net delta exposure
+uint256 public pendingDeposits;              // Queued deposits
+uint256 public pendingWithdrawals;           // Queued withdrawals
+uint256 public partitionedFunds;             // Funds set aside for withdrawals
+
+// Epochs for deposit/withdrawal rounds
+uint256 public depositEpoch;
+uint256 public withdrawalEpoch;
+mapping(uint256 => uint256) public depositEpochPricePerShare;
+mapping(uint256 => uint256) public withdrawalEpochPricePerShare;
+
+// User receipts
+mapping(address => IAccounting.DepositReceipt) public depositReceipts;
+mapping(address => IAccounting.WithdrawalReceipt) public withdrawalReceipts;
+
+// Risk parameters
+uint256 public bufferPercentage;             // Capital buffer (default 50%)
+uint256 public collateralCap;                // Max TVL
+address[] public hedgingReactors;            // Approved hedging contracts
+mapping(address => bool) public handler;     // Approved option handlers
+```
+
+**Key Functions**:
+
+**Deposit Flow**:
+```solidity
+function deposit(uint256 amount) external returns (bool)
+```
+- User deposits USDC
+- Creates/updates DepositReceipt with epoch number
+- Adds to pendingDeposits
+- Does NOT mint shares immediately (epoch-based)
+
+```solidity
+function initiateDeposit(uint256 amount) external
+function completeDeposit() external returns (uint256 shares)
+```
+- Two-step process for deposits
+- `initiateDeposit`: Queue deposit for next epoch
+- `completeDeposit`: After epoch executes, claim shares at epoch PPS
+
+**Withdrawal Flow**:
+```solidity
+function initiateWithdraw(uint256 shares) external
+function completeWithdraw() external returns (uint256 amount)
+```
+- Similar two-step process
+- Queues share burn for next epoch
+- Redeems USDC after epoch execution
+
+**Epoch Execution**:
+```solidity
+function executeEpochCalculation() external
+```
+- Called by keeper to finalize epoch
+- Calculates price per share (PPS)
+- Sets depositEpochPricePerShare and withdrawalEpochPricePerShare
+- Processes pending deposits/withdrawals
+- Can only execute after sufficient time passed
+
+**Options Writing** (Handler Functions):
+```solidity
+function handlerIssue(Types.OptionSeries memory optionSeries) 
+    external 
+    returns (address, uint256)
+```
+- Called by approved handlers (OptionExchange, AlphaOptionHandler)
+- Mints new option via OptionRegistry
+- Allocates collateral from pool
+- Updates ephemeralLiabilities and ephemeralDelta
+
+```solidity
+function handlerWriteOption(
+    Types.OptionSeries memory optionSeries,
+    address seriesAddress,
+    uint256 amount,
+    IOptionRegistry optionRegistry,
+    uint256 premium,
+    int256 delta,
+    address recipient
+) external returns (uint256)
+```
+- Complete option write operation
+- Transfers premium to pool
+- Updates accounting (collateral, delta, liabilities)
+- Returns option tokens to buyer
+
+```solidity
+function handlerBuybackOption(
+    Types.OptionSeries memory optionSeries,
+    uint256 amount,
+    IOptionRegistry optionRegistry,
+    address seriesAddress,
+    uint256 premium,
+    int256 delta,
+    address seller
+) external returns (uint256)
+```
+- Pool buys back options from users
+- Burns option tokens
+- Frees collateral
+- Updates accounting
+
+**Hedging Functions**:
+```solidity
+function rebalancePortfolioDelta(int256 delta, uint256 reactorIndex) external
+```
+- Called by keeper or handler to hedge delta
+- Executes hedge via specified HedgingReactor
+- Updates ephemeralDelta to track net exposure
+
+**Accounting Functions**:
+```solidity
+function getBalance(address asset) public view returns (uint256)
+```
+- Returns pool's balance of asset
+- Excludes partitionedFunds (committed to withdrawals)
+
+```solidity
+function getNAV() public view returns (uint256)
+```
+- Net Asset Value calculation
+- Balance + collateral in use - liabilities
+- Critical for PPS calculation
+
+**Access Control**:
+- `KEEPER_ROLE`: Execute epochs, rebalance hedges
+- `MANAGER_ROLE`: Set parameters, pause/unpause
+- Handlers: Write/buy options on behalf of pool
+
+### 2. OptionExchange.sol
+
+**Purpose**: Public exchange interface for standardized options trading.
+
+**Key Responsibilities**:
+- Provides quote and execution for buying/selling options
+- Integrates with BeyondPricer for pricing
+- Manages approved option series via OptionCatalogue
+- Handles token swaps for non-standard collateral
+- Enforces trade size limits
+
+**Inheritance**:
+```solidity
+contract OptionExchange is Pausable, AccessControl, ReentrancyGuard, IHedgingReactor
+```
+
+**State Variables**:
+```solidity
+ILiquidityPool public immutable liquidityPool;
+Protocol public immutable protocol;
+address public immutable strikeAsset;
+address public immutable underlyingAsset;
+address public immutable collateralAsset;
+AddressBookInterface public immutable addressbook;
+ISwapRouter public immutable swapRouter;
+
+BeyondPricer public pricer;
+OptionCatalogue public catalogue;
+uint256 public maxTradeSize;       // e.g., 1000e18
+uint256 public minTradeSize;       // e.g., 0.1e18
+address public feeRecipient;
+mapping(address => uint24) public poolFees;  // Uniswap V3 pool fees
+mapping(address => mapping(bool => bool)) public approvedCollateral;
+```
+
+**Core Trading Functions**:
+
+**Buying Options**:
+```solidity
+function operate(
+    Types.OptionSeries memory _optionSeries,
+    uint256 amount,
+    uint256 premium,
+    uint256 acceptablePremium,
+    address recipient
+) external nonReentrant returns (uint256 totalPremium)
+```
+- User buys options from the pool
+- Validates series against OptionCatalogue
+- Checks premium against acceptablePremium (slippage protection)
+- Transfers premium from user to pool
+- Calls `liquidityPool.handlerWriteOption()`
+- Returns option tokens to recipient
+
+**Selling Options to Pool**:
+```solidity
+function operateClose(
+    Types.OptionSeries memory _optionSeries,
+    uint256 amount,
+    uint256 premium,
+    uint256 acceptablePremium,
+    address seriesAddress
+) external nonReentrant returns (uint256 totalPremium)
+```
+- User sells options back to pool (close long position)
+- Validates ownership of option tokens
+- Gets quote from pricer
+- Calls `liquidityPool.handlerBuybackOption()`
+- Transfers premium to user
+
+**Pricing Functions**:
+```solidity
+function quoteOptionPrice(
+    Types.OptionSeries memory _optionSeries,
+    uint256 amount,
+    bool isBuy,
+    int256 netDhvExposure
+) public view returns (uint256 quote, int256 delta)
+```
+- Gets price quote from BeyondPricer
+- `isBuy`: true = user buying (pool selling), false = user selling (pool buying)
+- Returns premium and delta
+- Used by frontend before executing trade
+
+**Settlement Functions**:
+```solidity
+function settle(address seriesAddress) external nonReentrant returns (uint256)
+```
+- Settles expired options
+- Calls Opyn's controller.settle()
+- Distributes collateral based on settlement price
+
+**Hedging Reactor Interface**:
+```solidity
+function hedgeDelta(int256 delta) external returns (int256)
+function getDelta() external view returns (int256)
+function getPoolDenominatedValue() external view returns (uint256)
+function withdraw(uint256 amount) external returns (uint256)
+function update() external returns (uint256)
+```
+- OptionExchange implements IHedgingReactor
+- Allows it to act as a hedging mechanism for the pool
+- Can execute hedges via integrated DEX swaps
+
+**Fee Collection**:
+```solidity
+function collectFees(uint256 amount, address currency) external
+```
+- MANAGER can collect accumulated fees
+- Supports multiple currencies
+
+### 3. AlphaOptionHandler.sol
+
+**Purpose**: OTC/custom options trading interface for institutional/managed trades.
+
+**Key Features**:
+- Custom order creation by managers
+- Flexible strike/expiration combinations
+- Support for complex order types
+- Integration with same LiquidityPool backend
+
+**State Variables**:
+```solidity
+ILiquidityPool public immutable liquidityPool;
+Protocol public immutable protocol;
+BeyondPricer public pricer;
+uint256 public orderIdCounter;
+mapping(uint256 => Types.Order) public orderStores;  // Order ID => Order details
+mapping(bytes32 => uint256) public orderIdByHash;    // Hash => Order ID
+```
+
+**Order Structure**:
+```solidity
+struct Order {
+    Types.OptionSeries optionSeries;
+    uint256 amount;
+    uint256 price;
+    uint256 orderExpiry;
+    address buyer;
+    address seriesAddress;
+    uint256 collateralAmount;
+    bool isBuyBack;
+    bool isLong;  // true = user buying, false = user selling
+}
+```
+
+**Order Management**:
+```solidity
+function createOrder(
+    Types.OptionSeries memory optionSeries,
+    uint256 amount,
+    uint256 price,
+    uint256 orderExpiry,
+    address buyer,
+    bool isBuyBack,
+    uint256[2] memory spotMovementRange
+) external returns (uint256)
+```
+- MANAGER creates custom order
+- Specifies all terms including custom pricing
+- Can restrict to specific buyer address
+- Returns orderId
+
+```solidity
+function executeOrder(uint256 orderId) external nonReentrant
+```
+- User (or anyone if buyer = address(0)) executes order
+- Validates order hasn't expired
+- Executes trade through LiquidityPool
+- Deletes order after execution
+
+```solidity
+function cancelOrder(uint256 orderId) external
+```
+- MANAGER or buyer can cancel order
+- Removes from orderStores
+
+## Protocol Management Contracts
+
+### 4. Protocol.sol
+
+**Purpose**: Central registry and configuration management.
+
+**State Variables**:
+```solidity
+address public optionRegistry;
+address public liquidityPool;
+address public priceFeed;
+address public volatilityFeed;
+address public portfolioValuesFeed;
+address public accounting;
+address public authority;
+```
+
+**Functions**:
+- Stores addresses of all protocol contracts
+- Allows governance to update contract addresses
+- Single source of truth for contract locations
+
+### 5. Authority.sol
+
+**Purpose**: Role-based access control system.
+
+**Roles**:
+```solidity
+bytes32 public constant MANAGER_ROLE = keccak256("MANAGER");
+bytes32 public constant KEEPER_ROLE = keccak256("KEEPER");
+bytes32 public constant GOVERNANCE_ROLE = keccak256("GOVERNANCE");
+```
+
+**Functions**:
+- Grant/revoke roles
+- Check role membership
+- Inherited by all contracts needing access control
+
+### 6. OptionCatalogue.sol
+
+**Purpose**: Whitelist of approved option series for trading.
+
+**State Variables**:
+```solidity
+mapping(bytes32 => bool) public approvedOptions;  // series hash => approved
+ILiquidityPool public liquidityPool;
+```
+
+**Functions**:
+```solidity
+function issueNewSeries(Types.OptionSeries memory optionSeries) external
+```
+- MANAGER approves new option series for trading
+- Creates series in OptionRegistry if doesn't exist
+- Adds to approvedOptions mapping
+
+```solidity
+function checkHash(bytes32 _hash) external view returns (bool)
+```
+- Check if option series is approved
+- Used by OptionExchange before allowing trades
+
+## Integration Points
+
+### Opyn Gamma Protocol Integration
+
+MegaFi uses Opyn's Gamma Protocol for:
+- **Option Token Standard**: oTokens represent options
+- **Collateralization**: Vaults hold collateral
+- **Settlement**: Automated settlement at expiry
+- **Exercise**: Users can exercise ITM options
+
+**Key Opyn Contracts Used**:
+- **Controller**: Execute actions (mint, burn, settle)
+- **MarginCalculator**: Calculate collateral requirements
+- **Oracle**: Settlement price at expiry
+- **Whitelist**: Approved collateral/options
+- **AddressBook**: Registry of Opyn contracts
+
+### Hedging Protocol Integration
+
+**Supported Hedging Protocols**:
+1. **Uniswap V3**: Spot trading for delta hedging
+2. **Rage Trade**: Perpetual futures positions
+3. **GMX**: Perpetual futures positions
+
+Each protocol has dedicated HedgingReactor contract.
+
+## Security Features
+
+### Access Control Layers
+
+1. **Role-Based Access**:
+   - MANAGER: Configuration and risk parameters
+   - KEEPER: Operational tasks (epochs, hedging)
+   - GOVERNANCE: Contract upgrades
+
+2. **Handler Whitelist**:
+   - Only approved handlers can write options
+   - OptionExchange and AlphaOptionHandler approved by default
+
+3. **Pausability**:
+   - Emergency pause stops all trading
+   - Deposits/withdrawals can be paused separately
+
+### Reentrancy Protection
+
+All external functions use `nonReentrant` modifier:
+```solidity
+function operate(...) external nonReentrant returns (uint256)
+```
+
+### Slippage Protection
+
+Users specify `acceptablePremium` to prevent front-running:
+```solidity
+require(premium <= acceptablePremium, "Premium too high");
+```
+
+### Collateral Safety
+
+- Collateral allocated tracked precisely
+- Buffer percentage ensures excess collateral
+- Collateral requirements validated before writing options
+
+## Upgrade Pattern
+
+Contracts are **NOT upgradeable** (no proxy pattern). Changes require:
+1. Deploy new contract versions
+2. Update Protocol.sol registry
+3. Migrate liquidity (if necessary)
+
+This design prioritizes immutability and security over upgradeability.
+
+## Gas Optimization Techniques
+
+1. **Immutable Variables**: Maximum use of `immutable` for deployment-set values
+2. **Storage Packing**: Carefully ordered state variables for optimal packing
+3. **View Functions**: Off-chain calculations where possible
+4. **Events Over Storage**: Use events for historical data, not storage
+5. **Batch Operations**: Epoch system batches many operations
+
+## Testing Architecture
+
+Comprehensive test coverage in `test/` directory:
+- Unit tests for each contract
+- Integration tests for multi-contract flows
+- Scenario tests for edge cases
+- Foundry fuzzing tests for math functions
+
+Key test files:
+- `LiquidityPool.ts`: Core vault functionality
+- `OptionExchange.ts`: Trading flows
+- `BlackScholes.ts`: Pricing accuracy
+- `*HedgingReactor.ts`: Hedging mechanism tests
+
+---
+
+**This architecture enables**:
+- ✅ Modular, maintainable codebase
+- ✅ Clear separation of concerns
+- ✅ Secure access control
+- ✅ Efficient gas usage
+- ✅ Integration with multiple DeFi protocols
+- ✅ Comprehensive testing

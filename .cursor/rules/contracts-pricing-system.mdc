@@ -1,0 +1,911 @@
+---
+alwaysApply: false
+---
+# Pricing System & Oracle Infrastructure
+
+Technical documentation for the pricing engine, volatility modeling, oracle integration, and mathematical libraries used in MegaFi Hedge.
+
+## BeyondPricer.sol - Advanced Options Pricing Engine
+
+### Overview
+
+BeyondPricer is a sophisticated options pricing contract that extends Black-Scholes with DeFi-specific adjustments for:
+- Pool delta exposure and inventory risk
+- Collateral lending rates
+- Delta borrowing costs
+- Slippage based on trade size
+- Bid-ask spreads
+- Volatility skew
+
+### Contract Structure
+
+```solidity
+contract BeyondPricer is AccessControl, ReentrancyGuard
+```
+
+### Core State Variables
+
+**Immutable Configuration**:
+```solidity
+ILiquidityPool public immutable liquidityPool;
+Protocol public immutable protocol;
+AddressBookInterface public immutable addressBook;
+address public immutable strikeAsset;      // USDC
+address public immutable underlyingAsset;  // WETH
+address public immutable collateralAsset;  // USDC
+```
+
+**Pricing Parameters**:
+```solidity
+// Base parameters
+uint256 public bidAskIVSpread;        // IV difference between bid/ask
+uint256 public riskFreeRate;          // DeFi lending rate (e.g., USDC yield)
+uint256 public feePerContract;        // Flat fee per option (e.g., 5e5 = $0.50)
+uint256 public slippageGradient;      // Base slippage factor
+
+// Delta band system
+uint256 public deltaBandWidth;        // Width of each delta band (e.g., 0.1 = 10%)
+uint16 public numberOfTenors;         // Number of expiry buckets
+uint16 public maxTenorValue;          // Maximum tenor in sqrt(seconds)
+
+// Collateral and delta costs
+uint256 public collateralLendingRate;  // Annual rate for collateral (6 decimals)
+DeltaBorrowRates public deltaBorrowRates;  // Rates for hedging delta
+
+// Low delta thresholds
+uint256 public lowDeltaSellOptionFlatIV;  // IV floor for deep OTM (e.g., 35%)
+uint256 public lowDeltaThreshold;          // Delta cutoff (e.g., 0.05)
+```
+
+**Delta Band Multipliers**:
+```solidity
+struct DeltaBandMultipliers {
+    int80[] callSlippageGradientMultipliers;    // Slippage adjustments by delta
+    int80[] putSlippageGradientMultipliers;
+    int80[] callSpreadCollateralMultipliers;    // Collateral spread by delta
+    int80[] putSpreadCollateralMultipliers;
+    int80[] callSpreadDeltaMultipliers;         // Delta borrowing by delta
+    int80[] putSpreadDeltaMultipliers;
+}
+
+DeltaBandMultipliers[] internal tenorPricingParams;  // One per tenor bucket
+```
+
+**Delta Borrow Rates**:
+```solidity
+struct DeltaBorrowRates {
+    int sellLong;   // User sells puts → DHV longs to hedge
+    int sellShort;  // User sells calls → DHV shorts to hedge  
+    int buyLong;    // User buys calls → DHV longs to hedge
+    int buyShort;   // User buys puts → DHV shorts to hedge
+}
+```
+
+### Pricing Functions
+
+**Main Quoting Function**:
+```solidity
+function quoteOptionPrice(
+    Types.OptionSeries memory _optionSeries,
+    uint256 _amount,
+    bool isBuy,
+    int256 netDhvExposure
+) external view returns (
+    uint256 premium,
+    int256 delta,
+    uint256 deltaBorrowFees,
+    uint256 collateralLendingFees
+)
+```
+
+**Parameters**:
+- `_optionSeries`: Strike, expiry, isPut, underlying, strike asset, collateral
+- `_amount`: Number of contracts (e18 format)
+- `isBuy`: true = user buying (DHV selling), false = user selling (DHV buying)
+- `netDhvExposure`: Current pool delta exposure
+
+**Returns**:
+- `premium`: Total premium in USDC (e6 for USDC)
+- `delta`: Net delta of the trade
+- `deltaBorrowFees`: Cost/credit for hedging the delta
+- `collateralLendingFees`: Cost/credit for collateral usage
+
+**Pricing Flow**:
+
+1. **Get Underlying Price**:
+```solidity
+uint256 underlyingPrice = _getUnderlyingPrice(
+    _optionSeries.underlying,
+    _optionSeries.strikeAsset
+);
+```
+
+2. **Get Implied Volatility**:
+```solidity
+uint256 iv = _getImpliedVolatility(
+    _optionSeries.isPut,
+    underlyingPrice,
+    _optionSeries.strike,
+    _optionSeries.expiration
+);
+```
+
+3. **Adjust IV for Bid/Ask Spread**:
+```solidity
+if (isBuy) {
+    // User buying: increase IV (higher premium)
+    iv += bidAskIVSpread;
+} else {
+    // User selling: decrease IV (lower premium)
+    if (iv > bidAskIVSpread) {
+        iv -= bidAskIVSpread;
+    }
+}
+```
+
+4. **Apply Low Delta Floor** (for deep OTM options):
+```solidity
+// Calculate initial delta
+int256 delta = _calculateDelta(...);
+
+// If option is very OTM and user is selling to pool
+if (!isBuy && absoluteDelta < lowDeltaThreshold) {
+    iv = lowDeltaSellOptionFlatIV;  // Floor IV at e.g., 35%
+}
+```
+
+5. **Calculate Black-Scholes Premium**:
+```solidity
+uint256 premium = BlackScholes.blackScholesCalc(
+    underlyingPrice,
+    _optionSeries.strike,
+    timeToExpiry,
+    iv,
+    riskFreeRate,
+    _optionSeries.isPut
+);
+```
+
+6. **Calculate Greeks**:
+```solidity
+delta = BlackScholes.calculateDelta(
+    underlyingPrice,
+    _optionSeries.strike,
+    timeToExpiry,
+    iv,
+    riskFreeRate,
+    _optionSeries.isPut
+);
+```
+
+7. **Apply Slippage** (based on trade size and pool exposure):
+```solidity
+(uint256 slippagePremium, int256 slippageDelta) = _calculateSlippage(
+    _optionSeries,
+    _amount,
+    delta,
+    netDhvExposure,
+    isBuy
+);
+
+premium += slippagePremium;
+delta += slippageDelta;
+```
+
+8. **Calculate Spread Components**:
+```solidity
+// Collateral lending fees
+collateralLendingFees = _calculateCollateralLendingFees(
+    _optionSeries,
+    _amount,
+    delta,
+    isBuy
+);
+
+// Delta borrowing fees
+deltaBorrowFees = _calculateDeltaBorrowFees(
+    _optionSeries,
+    _amount,
+    delta,
+    isBuy
+);
+
+// Add to premium
+premium += collateralLendingFees + deltaBorrowFees;
+```
+
+9. **Add Flat Fee**:
+```solidity
+uint256 flatFee = (_amount * feePerContract) / 1e18;
+premium += flatFee;
+```
+
+10. **Scale to Trade Size**:
+```solidity
+premium = (premium * _amount) / 1e18;
+delta = (delta * int256(_amount)) / 1e18;
+```
+
+### Slippage Calculation
+
+**Purpose**: Adjust pricing based on how trade affects pool's delta exposure.
+
+```solidity
+function _calculateSlippage(
+    Types.OptionSeries memory _optionSeries,
+    uint256 _amount,
+    int256 _delta,
+    int256 netDhvExposure,
+    bool isBuy
+) internal view returns (uint256 slippagePremium, int256 slippageDelta)
+```
+
+**Logic**:
+
+1. **Determine Trade's Impact on Pool**:
+```solidity
+int256 tradeDirection;
+if (_optionSeries.isPut) {
+    // Puts: negative delta
+    tradeDirection = isBuy ? int256(1) : int256(-1);
+} else {
+    // Calls: positive delta
+    tradeDirection = isBuy ? int256(-1) : int256(1);
+}
+```
+
+2. **Get Delta Band** (which bucket does this delta fall into):
+```solidity
+uint256 deltaBand = _getDeltaBand(absoluteDelta);
+```
+
+3. **Get Tenor Bucket** (time-based pricing tier):
+```solidity
+uint256 tenorIndex = _getTenorIndex(timeToExpiry);
+```
+
+4. **Retrieve Slippage Multiplier**:
+```solidity
+int80 slippageMultiplier = _optionSeries.isPut
+    ? tenorPricingParams[tenorIndex].putSlippageGradientMultipliers[deltaBand]
+    : tenorPricingParams[tenorIndex].callSlippageGradientMultipliers[deltaBand];
+```
+
+5. **Calculate Slippage**:
+```solidity
+// Base slippage
+int256 baseSlippage = int256(slippageGradient);
+
+// Adjust by multiplier
+int256 adjustedSlippage = (baseSlippage * int256(slippageMultiplier)) / 1e18;
+
+// Factor in pool's current exposure
+int256 exposureFactor = (netDhvExposure * tradeDirection) / 1e18;
+
+// Final slippage
+slippagePremium = uint256(adjustedSlippage * exposureFactor * int256(_amount)) / 1e18;
+```
+
+**Key Insight**: The more a trade pushes the pool away from delta-neutral, the more expensive it gets. This incentivizes trades that help rebalance the pool.
+
+### Collateral Lending Fees
+
+**Purpose**: Charge for the cost of locking collateral to write options.
+
+```solidity
+function _calculateCollateralLendingFees(
+    Types.OptionSeries memory _optionSeries,
+    uint256 _amount,
+    int256 _delta,
+    bool isBuy
+) internal view returns (uint256 collateralFees)
+```
+
+**Logic**:
+
+1. **Calculate Collateral Required**:
+```solidity
+uint256 collateralAmount;
+if (_optionSeries.isPut) {
+    // Put: strike price worth of USDC per contract
+    collateralAmount = _optionSeries.strike;
+} else {
+    // Call: 1 underlying token per contract
+    collateralAmount = underlyingPrice;
+}
+```
+
+2. **Get Tenor and Delta Band**:
+```solidity
+uint256 tenorIndex = _getTenorIndex(timeToExpiry);
+uint256 deltaBand = _getDeltaBand(absoluteDelta);
+```
+
+3. **Get Collateral Multiplier**:
+```solidity
+int80 collateralMultiplier = _optionSeries.isPut
+    ? tenorPricingParams[tenorIndex].putSpreadCollateralMultipliers[deltaBand]
+    : tenorPricingParams[tenorIndex].callSpreadCollateralMultipliers[deltaBand];
+```
+
+4. **Calculate Fee**:
+```solidity
+// Annual collateral lending rate
+uint256 annualRate = collateralLendingRate;
+
+// Pro-rated for option duration
+uint256 durationRate = (annualRate * timeToExpiry) / 365 days;
+
+// Apply multiplier
+uint256 adjustedRate = (durationRate * uint256(int256(collateralMultiplier))) / 1e18;
+
+// Calculate fee
+collateralFees = (collateralAmount * adjustedRate * _amount) / 1e36;
+
+// Direction: user buys = DHV charges, user sells = DHV pays
+if (!isBuy) {
+    collateralFees = 0;  // DHV doesn't charge when buying options back
+}
+```
+
+### Delta Borrowing Fees
+
+**Purpose**: Charge for the cost of hedging the delta exposure.
+
+```solidity
+function _calculateDeltaBorrowFees(
+    Types.OptionSeries memory _optionSeries,
+    uint256 _amount,
+    int256 _delta,
+    bool isBuy
+) internal view returns (uint256 deltaBorrowFees)
+```
+
+**Logic**:
+
+1. **Determine Hedging Direction**:
+```solidity
+int256 hedgingRate;
+if (_optionSeries.isPut) {
+    if (isBuy) {
+        // User buys put → DHV sells put → needs to short to hedge
+        hedgingRate = deltaBorrowRates.buyShort;
+    } else {
+        // User sells put → DHV buys put → needs to long to hedge
+        hedgingRate = deltaBorrowRates.sellLong;
+    }
+} else {
+    if (isBuy) {
+        // User buys call → DHV sells call → needs to long to hedge
+        hedgingRate = deltaBorrowRates.buyLong;
+    } else {
+        // User sells call → DHV buys call → needs to short to hedge
+        hedgingRate = deltaBorrowRates.sellShort;
+    }
+}
+```
+
+2. **Get Delta Band Multiplier**:
+```solidity
+uint256 tenorIndex = _getTenorIndex(timeToExpiry);
+uint256 deltaBand = _getDeltaBand(absoluteDelta);
+
+int80 deltaMultiplier = _optionSeries.isPut
+    ? tenorPricingParams[tenorIndex].putSpreadDeltaMultipliers[deltaBand]
+    : tenorPricingParams[tenorIndex].callSpreadDeltaMultipliers[deltaBand];
+```
+
+3. **Calculate Fee**:
+```solidity
+// Annual rate
+int256 annualRate = hedgingRate;
+
+// Pro-rated
+int256 durationRate = (annualRate * int256(timeToExpiry)) / 365 days;
+
+// Apply multiplier
+int256 adjustedRate = (durationRate * int256(deltaMultiplier)) / 1e18;
+
+// Calculate on notional delta
+deltaBorrowFees = uint256(
+    (absoluteDelta * adjustedRate * int256(_amount)) / 1e36
+);
+```
+
+### Volatility Integration
+
+```solidity
+function _getImpliedVolatility(
+    bool isPut,
+    uint256 underlyingPrice,
+    uint256 strikePrice,
+    uint256 expiration
+) internal view returns (uint256 iv)
+```
+
+**Process**:
+
+1. **Get Volatility Feed**:
+```solidity
+IVolatilityFeed volFeed = IVolatilityFeed(
+    protocol.volatilityFeed()
+);
+```
+
+2. **Calculate Forward Price** (for SABR model):
+```solidity
+uint256 forwardPrice = underlyingPrice;  // Simplified, can adjust for dividends
+```
+
+3. **Query SABR Volatility**:
+```solidity
+(uint256[] memory sabr, ) = volFeed.getImpliedVolatility(
+    isPut,
+    underlyingPrice,
+    strikePrice,
+    expiration
+);
+
+iv = sabr[0];  // Return first element (mid IV)
+```
+
+4. **Validation**:
+```solidity
+require(iv > 0, "Invalid IV");
+require(iv < MAX_IV, "IV too high");  // e.g., 500%
+```
+
+### Price Oracle Integration
+
+```solidity
+function _getUnderlyingPrice(
+    address underlying,
+    address strike
+) internal view returns (uint256)
+```
+
+**Process**:
+
+1. **Get PriceFeed Contract**:
+```solidity
+IPriceFeed priceFeed = IPriceFeed(protocol.priceFeed());
+```
+
+2. **Query Price**:
+```solidity
+uint256 price = priceFeed.getNormalizedRate(underlying, strike);
+```
+
+3. **Validation**:
+```solidity
+require(price > 0, "Invalid price");
+require(
+    block.timestamp - priceFeed.getLastUpdateTime() < maxStaleness,
+    "Price too stale"
+);
+```
+
+### Parameter Management
+
+**Setting Slippage Parameters**:
+```solidity
+function setSlippageGradient(uint256 _slippageGradient) external
+```
+
+**Setting Delta Bands**:
+```solidity
+function setDeltaBandMultipliers(
+    uint256 tenorIndex,
+    DeltaBandMultipliers memory multipliers
+) external
+```
+
+**Setting Collateral Rate**:
+```solidity
+function setCollateralLendingRate(uint256 _rate) external
+```
+
+**Setting Delta Borrow Rates**:
+```solidity
+function setDeltaBorrowRates(
+    int sellLong,
+    int sellShort,
+    int buyLong,
+    int buyShort
+) external
+```
+
+All require `MANAGER_ROLE`.
+
+## VolatilityFeed.sol - SABR Volatility Surface
+
+### Overview
+
+Provides implied volatility using the SABR (Stochastic Alpha Beta Rho) model, which captures volatility smile and skew.
+
+### Contract Structure
+
+```solidity
+contract VolatilityFeed is AccessControl
+```
+
+### State Variables
+
+```solidity
+// SABR parameters per tenor
+mapping(uint256 => Types.SABRParams) public sabrParams;
+
+struct SABRParams {
+    int32 callAlpha;      // ATM volatility
+    int32 callBeta;       // CEV parameter (0 = normal, 1 = lognormal)
+    int32 callRho;        // Correlation
+    int32 callVolvol;     // Volatility of volatility
+    int32 putAlpha;
+    int32 putBeta;
+    int32 putRho;
+    int32 putVolvol;
+    int32 interestRate;
+}
+
+// Tenor buckets (e.g., 7d, 30d, 90d, 180d)
+uint256[] public tenors;
+
+// Keeper for updates
+mapping(address => bool) public keeper;
+```
+
+### SABR Formula
+
+**Implied Volatility Calculation**:
+
+```solidity
+function getImpliedVolatility(
+    bool isPut,
+    uint256 underlyingPrice,
+    uint256 strikePrice,
+    uint256 expiration
+) external view returns (uint256[] memory, uint256)
+```
+
+**Process**:
+
+1. **Find Tenor Bucket**:
+```solidity
+uint256 timeToExpiry = expiration - block.timestamp;
+uint256 tenorIndex = _getTenorIndex(timeToExpiry);
+```
+
+2. **Get SABR Parameters**:
+```solidity
+Types.SABRParams memory params = sabrParams[tenorIndex];
+int32 alpha = isPut ? params.putAlpha : params.callAlpha;
+int32 beta = isPut ? params.putBeta : params.callBeta;
+int32 rho = isPut ? params.putRho : params.callRho;
+int32 volvol = isPut ? params.putVolvol : params.callVolvol;
+```
+
+3. **Calculate Forward Price**:
+```solidity
+uint256 forward = underlyingPrice;  // Can adjust for carry costs
+```
+
+4. **Apply SABR Formula** (implemented in SABR.sol library):
+```solidity
+uint256 iv = SABR.calculateIV(
+    forward,
+    strikePrice,
+    timeToExpiry,
+    alpha,
+    beta,
+    rho,
+    volvol
+);
+```
+
+5. **Interpolation** (if between tenor buckets):
+```solidity
+if (needsInterpolation) {
+    uint256 iv1 = _getIVAtTenor(tenor1, ...);
+    uint256 iv2 = _getIVAtTenor(tenor2, ...);
+    iv = _interpolate(iv1, iv2, weight);
+}
+```
+
+### SABR Parameters
+
+**Call Parameters** (upside volatility):
+- `callAlpha`: Base ATM volatility level
+- `callBeta`: Backbone of volatility smile (0 = normal, 1 = lognormal)
+- `callRho`: Correlation between price and volatility
+- `callVolvol`: Volatility of volatility (convexity of smile)
+
+**Put Parameters** (downside volatility):
+- Separate parameters allow put/call skew
+- Typically, puts have higher IV (downside protection demand)
+
+### Updating Parameters
+
+```solidity
+function setSABR(
+    uint256 _tenor,
+    int32 _callAlpha,
+    int32 _callBeta,
+    int32 _callRho,
+    int32 _callVolvol,
+    int32 _putAlpha,
+    int32 _putBeta,
+    int32 _putRho,
+    int32 _putVolvol,
+    int32 _interestRate
+) external
+```
+
+- Called by keeper or manager
+- Updates SABR parameters for specific tenor
+- Should be updated regularly based on market conditions
+
+### Tenor Management
+
+```solidity
+function setTenors(uint256[] memory _tenors) external
+```
+
+- Define tenor buckets (e.g., [7 days, 30 days, 90 days, 180 days])
+- Must be in ascending order
+
+## PriceFeed.sol - Oracle Price Aggregation
+
+### Overview
+
+Provides reliable, manipulation-resistant price feeds using Chainlink oracles with validation and fallback mechanisms.
+
+### Contract Structure
+
+```solidity
+contract PriceFeed is AccessControl
+```
+
+### State Variables
+
+```solidity
+// Chainlink oracle addresses
+mapping(address => mapping(address => address)) public oracles;  // asset => quote => oracle
+
+// Price staleness threshold
+uint256 public maxPriceDeviationThreshold;  // e.g., 1% = 1e16
+uint256 public maxTimeDeviationThreshold;   // e.g., 600 seconds
+
+// Fallback prices (in case oracle fails)
+mapping(bytes32 => uint256) public fallbackPrices;
+mapping(bytes32 => uint256) public fallbackUpdateTimes;
+```
+
+### Price Retrieval
+
+```solidity
+function getNormalizedRate(
+    address underlying,
+    address strike
+) external view returns (uint256 rate)
+```
+
+**Process**:
+
+1. **Get Oracle Address**:
+```solidity
+address oracleAddress = oracles[underlying][strike];
+require(oracleAddress != address(0), "Oracle not set");
+```
+
+2. **Query Chainlink**:
+```solidity
+AggregatorV3Interface oracle = AggregatorV3Interface(oracleAddress);
+
+(
+    uint80 roundId,
+    int256 price,
+    uint256 startedAt,
+    uint256 updatedAt,
+    uint80 answeredInRound
+) = oracle.latestRoundData();
+```
+
+3. **Validate Price**:
+```solidity
+require(price > 0, "Invalid price");
+require(answeredInRound >= roundId, "Stale price");
+require(
+    block.timestamp - updatedAt <= maxTimeDeviationThreshold,
+    "Price too old"
+);
+```
+
+4. **Normalize Decimals**:
+```solidity
+uint8 oracleDecimals = oracle.decimals();
+if (oracleDecimals < 18) {
+    rate = uint256(price) * (10 ** (18 - oracleDecimals));
+} else {
+    rate = uint256(price) / (10 ** (oracleDecimals - 18));
+}
+```
+
+5. **Circuit Breaker** (prevent manipulation):
+```solidity
+uint256 previousPrice = _getPreviousPrice(underlying, strike);
+uint256 priceDiff = _calculatePercentageDiff(rate, previousPrice);
+
+require(
+    priceDiff <= maxPriceDeviationThreshold,
+    "Price moved too much"
+);
+```
+
+### Fallback Mechanism
+
+If Chainlink fails:
+
+```solidity
+function getFallbackPrice(
+    address underlying,
+    address strike
+) public view returns (uint256)
+```
+
+- Returns manually set fallback price
+- Should be updated by keeper regularly
+- Used as last resort
+
+### Oracle Management
+
+```solidity
+function setOracle(
+    address underlying,
+    address strike,
+    address oracle
+) external
+```
+
+- MANAGER sets Chainlink oracle addresses
+- Example: `setOracle(WETH, USDC, 0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612)` (ETH/USD on Arbitrum)
+
+```solidity
+function setFallbackPrice(
+    address underlying,
+    address strike,
+    uint256 price
+) external
+```
+
+- KEEPER updates fallback prices
+- Used if primary oracle fails
+
+## AlphaPortfolioValuesFeed.sol - Net Asset Value Calculator
+
+### Overview
+
+Calculates the Dynamic Hedging Vault's Net Asset Value (NAV) including all positions, collateral, and liabilities.
+
+### Contract Structure
+
+```solidity
+contract AlphaPortfolioValuesFeed is AccessControl
+```
+
+### State Variables
+
+```solidity
+ILiquidityPool public liquidityPool;
+Protocol public protocol;
+
+// Portfolio calculation parameters
+uint256 public rfr;  // Risk-free rate
+mapping(address => address) public hedgingReactorAssetPricers;
+```
+
+### NAV Calculation
+
+```solidity
+function getPortfolioValues(
+    address underlying,
+    address strike
+) external view returns (int256 portfolioValue)
+```
+
+**Components**:
+
+1. **Collateral Balance**:
+```solidity
+uint256 collateralBalance = liquidityPool.getBalance(collateralAsset);
+```
+
+2. **Options Liabilities**:
+```solidity
+int256 optionsValue = _calculateOptionsValue(underlying, strike);
+```
+
+Gets all open option positions from OptionRegistry and values them:
+```solidity
+// For each option series held
+for (uint i = 0; i < optionSeries.length; i++) {
+    uint256 amount = optionRegistry.balanceOf(seriesAddress);
+    
+    // Get current market value
+    uint256 marketValue = _getOptionMarketValue(optionSeries[i], amount);
+    
+    // Subtract from portfolio (liability)
+    optionsValue -= int256(marketValue);
+}
+```
+
+3. **Hedging Positions**:
+```solidity
+int256 hedgingValue = _calculateHedgingValue();
+```
+
+Gets value of all positions in hedging reactors:
+```solidity
+for (uint i = 0; i < hedgingReactors.length; i++) {
+    IHedgingReactor reactor = IHedgingReactor(hedgingReactors[i]);
+    uint256 reactorValue = reactor.getPoolDenominatedValue();
+    hedgingValue += int256(reactorValue);
+}
+```
+
+4. **Pending Settlements**:
+```solidity
+int256 settlementsValue = _getPendingSettlements();
+```
+
+5. **Total NAV**:
+```solidity
+portfolioValue = 
+    int256(collateralBalance) + 
+    optionsValue + 
+    hedgingValue + 
+    settlementsValue;
+```
+
+### Option Valuation
+
+```solidity
+function _getOptionMarketValue(
+    Types.OptionSeries memory series,
+    uint256 amount
+) internal view returns (uint256)
+```
+
+Uses BeyondPricer to get current market value:
+```solidity
+BeyondPricer pricer = BeyondPricer(protocol.pricer());
+
+(uint256 premium, , , ) = pricer.quoteOptionPrice(
+    series,
+    amount,
+    false,  // Selling back to get value
+    liquidityPool.ephemeralDelta()
+);
+
+return premium;
+```
+
+### Usage in Epochs
+
+Called during `executeEpochCalculation()` to determine price per share:
+
+```solidity
+uint256 nav = portfolioValuesFeed.getPortfolioValues(underlying, strike);
+uint256 totalShares = liquidityPool.totalSupply();
+
+uint256 pricePerShare = (nav * 1e18) / totalShares;
+```
+
+---
+
+**Key Takeaways**:
+- ✅ BeyondPricer implements sophisticated multi-factor options pricing
+- ✅ SABR model captures realistic volatility smiles
+- ✅ Chainlink integration provides secure price feeds
+- ✅ NAV calculation accounts for all portfolio components
+- ✅ Delta band system enables granular risk-based pricing
+- ✅ Spread components incentivize balanced pool exposure

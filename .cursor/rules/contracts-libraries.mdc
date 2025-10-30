@@ -1,0 +1,850 @@
+---
+alwaysApply: false
+---
+# Mathematical Libraries & Core Utilities
+
+Technical documentation for all mathematical libraries, utility functions, and shared types used throughout the MegaFi Hedge protocol.
+
+## BlackScholes.sol - Options Pricing Mathematics
+
+### Overview
+
+Implements the Black-Scholes-Merton model for European options pricing and Greeks calculation. Core mathematical engine for option valuation.
+
+### Library Structure
+
+```solidity
+library BlackScholes {
+    using PRBMathSD59x18 for int256;
+    using PRBMathUD60x18 for uint256;
+}
+```
+
+Uses PRBMath for high-precision fixed-point arithmetic (59.18 signed, 60.18 unsigned).
+
+### Core Pricing Functions
+
+**Black-Scholes Formula**:
+```solidity
+function blackScholesCalc(
+    uint256 spotPrice,      // Current underlying price
+    uint256 strikePrice,    // Option strike price
+    uint256 timeToExpiry,   // Time remaining in seconds
+    uint256 volatility,     // Annual implied volatility (e18)
+    uint256 riskFreeRate,   // Annual risk-free rate (e18)
+    bool isPut              // true for put, false for call
+) public pure returns (uint256 premium)
+```
+
+**Implementation**:
+
+1. **Convert to Fixed-Point**:
+```solidity
+int256 S = int256(spotPrice);
+int256 K = int256(strikePrice);
+int256 T = int256(timeToExpiry).div(int256(365 days));  // Years
+int256 sigma = int256(volatility);
+int256 r = int256(riskFreeRate);
+```
+
+2. **Calculate d1 and d2**:
+```solidity
+// d1 = [ln(S/K) + (r + σ²/2) × T] / (σ × √T)
+int256 lnSK = S.div(K).ln();  // ln(S/K)
+int256 sigmaSq = sigma.mul(sigma);  // σ²
+int256 numerator = lnSK.add(
+    r.add(sigmaSq.div(2e18)).mul(T)
+);
+int256 denominator = sigma.mul(T.sqrt());
+int256 d1 = numerator.div(denominator);
+
+// d2 = d1 - σ × √T
+int256 d2 = d1.sub(sigma.mul(T.sqrt()));
+```
+
+3. **Calculate N(d1) and N(d2)** (cumulative normal distribution):
+```solidity
+int256 Nd1 = _normalCDF(d1);
+int256 Nd2 = _normalCDF(d2);
+```
+
+4. **Calculate Premium**:
+
+For **Call Options**:
+```solidity
+// C = S × N(d1) - K × e^(-r×T) × N(d2)
+int256 callPrice = S.mul(Nd1).sub(
+    K.mul((-r.mul(T)).exp()).mul(Nd2)
+);
+premium = uint256(callPrice);
+```
+
+For **Put Options**:
+```solidity
+// P = K × e^(-r×T) × N(-d2) - S × N(-d1)
+int256 putPrice = K.mul((-r.mul(T)).exp()).mul(_normalCDF(d2.neg()))
+    .sub(S.mul(_normalCDF(d1.neg())));
+premium = uint256(putPrice);
+```
+
+Alternative via **Put-Call Parity**:
+```solidity
+// P = C - S + K × e^(-r×T)
+uint256 callPrice = blackScholesCalc(..., false);
+int256 putPrice = int256(callPrice)
+    .sub(int256(S))
+    .add(K.mul((-r.mul(T)).exp()));
+premium = uint256(putPrice);
+```
+
+### Greeks Calculations
+
+**Delta (Δ)** - Price sensitivity:
+```solidity
+function calculateDelta(
+    uint256 spotPrice,
+    uint256 strikePrice,
+    uint256 timeToExpiry,
+    uint256 volatility,
+    uint256 riskFreeRate,
+    bool isPut
+) public pure returns (int256 delta)
+```
+
+**Call Delta**:
+```solidity
+// Δ_call = N(d1)
+int256 d1 = _calculateD1(spotPrice, strikePrice, timeToExpiry, volatility, riskFreeRate);
+delta = _normalCDF(d1);  // Range: 0 to 1
+```
+
+**Put Delta**:
+```solidity
+// Δ_put = N(d1) - 1
+int256 d1 = _calculateD1(...);
+delta = _normalCDF(d1).sub(1e18);  // Range: -1 to 0
+```
+
+**Gamma (Γ)** - Delta sensitivity:
+```solidity
+function calculateGamma(
+    uint256 spotPrice,
+    uint256 strikePrice,
+    uint256 timeToExpiry,
+    uint256 volatility,
+    uint256 riskFreeRate
+) public pure returns (uint256 gamma)
+```
+
+**Formula**:
+```solidity
+// Γ = φ(d1) / (S × σ × √T)
+// Where φ(d1) is the standard normal PDF
+
+int256 d1 = _calculateD1(...);
+int256 phi_d1 = _normalPDF(d1);
+
+int256 denominator = int256(spotPrice)
+    .mul(int256(volatility))
+    .mul(int256(timeToExpiry).div(int256(365 days)).sqrt());
+
+gamma = uint256(phi_d1.div(denominator));
+```
+
+Note: Gamma is the same for calls and puts with same strike/expiry.
+
+**Theta (Θ)** - Time decay:
+```solidity
+function calculateTheta(
+    uint256 spotPrice,
+    uint256 strikePrice,
+    uint256 timeToExpiry,
+    uint256 volatility,
+    uint256 riskFreeRate,
+    bool isPut
+) public pure returns (int256 theta)
+```
+
+**Call Theta**:
+```solidity
+// Θ_call = -(S × φ(d1) × σ) / (2 × √T) - r × K × e^(-r×T) × N(d2)
+
+int256 d1 = _calculateD1(...);
+int256 d2 = _calculateD2(...);
+int256 phi_d1 = _normalPDF(d1);
+int256 T_sqrt = int256(timeToExpiry).div(int256(365 days)).sqrt();
+
+int256 term1 = int256(spotPrice)
+    .mul(phi_d1)
+    .mul(int256(volatility))
+    .div(2e18.mul(T_sqrt));
+
+int256 term2 = int256(riskFreeRate)
+    .mul(int256(strikePrice))
+    .mul((-int256(riskFreeRate).mul(T)).exp())
+    .mul(_normalCDF(d2));
+
+theta = term1.neg().sub(term2);
+```
+
+**Put Theta**:
+```solidity
+// Θ_put = -(S × φ(d1) × σ) / (2 × √T) + r × K × e^(-r×T) × N(-d2)
+
+// Similar to call, but second term is positive
+theta = term1.neg().add(term2_put);
+```
+
+**Vega (ν)** - Volatility sensitivity:
+```solidity
+function calculateVega(
+    uint256 spotPrice,
+    uint256 strikePrice,
+    uint256 timeToExpiry,
+    uint256 volatility,
+    uint256 riskFreeRate
+) public pure returns (uint256 vega)
+```
+
+**Formula**:
+```solidity
+// ν = S × φ(d1) × √T
+
+int256 d1 = _calculateD1(...);
+int256 phi_d1 = _normalPDF(d1);
+int256 T_sqrt = int256(timeToExpiry).div(int256(365 days)).sqrt();
+
+vega = uint256(
+    int256(spotPrice).mul(phi_d1).mul(T_sqrt)
+);
+```
+
+Note: Vega is the same for calls and puts.
+
+**Rho (ρ)** - Interest rate sensitivity:
+```solidity
+function calculateRho(
+    uint256 spotPrice,
+    uint256 strikePrice,
+    uint256 timeToExpiry,
+    uint256 volatility,
+    uint256 riskFreeRate,
+    bool isPut
+) public pure returns (int256 rho)
+```
+
+**Call Rho**:
+```solidity
+// ρ_call = K × T × e^(-r×T) × N(d2)
+
+int256 d2 = _calculateD2(...);
+int256 T = int256(timeToExpiry).div(int256(365 days));
+
+rho = int256(strikePrice)
+    .mul(T)
+    .mul((-int256(riskFreeRate).mul(T)).exp())
+    .mul(_normalCDF(d2));
+```
+
+**Put Rho**:
+```solidity
+// ρ_put = -K × T × e^(-r×T) × N(-d2)
+
+rho = int256(strikePrice)
+    .mul(T)
+    .mul((-int256(riskFreeRate).mul(T)).exp())
+    .mul(_normalCDF(d2.neg()))
+    .neg();
+```
+
+### Statistical Functions
+
+**Cumulative Normal Distribution N(x)**:
+```solidity
+function _normalCDF(int256 x) internal pure returns (int256)
+```
+
+Uses **Abramowitz and Stegun approximation**:
+```solidity
+// For x >= 0:
+// N(x) ≈ 1 - φ(x) × (a₁t + a₂t² + a₃t³ + a₄t⁴ + a₅t⁵)
+// Where t = 1 / (1 + p × x)
+
+int256 a1 = 0.254829592e18;
+int256 a2 = -0.284496736e18;
+int256 a3 = 1.421413741e18;
+int256 a4 = -1.453152027e18;
+int256 a5 = 1.061405429e18;
+int256 p = 0.3275911e18;
+
+if (x >= 0) {
+    int256 t = 1e18.div(1e18.add(p.mul(x)));
+    int256 phi = _normalPDF(x);
+    int256 poly = a1.mul(t)
+        .add(a2.mul(t.mul(t)))
+        .add(a3.mul(t.mul(t).mul(t)))
+        .add(a4.mul(t.mul(t).mul(t).mul(t)))
+        .add(a5.mul(t.mul(t).mul(t).mul(t).mul(t)));
+    
+    return 1e18.sub(phi.mul(poly));
+} else {
+    // N(-x) = 1 - N(x)
+    return 1e18.sub(_normalCDF(x.neg()));
+}
+```
+
+**Normal Probability Density Function φ(x)**:
+```solidity
+function _normalPDF(int256 x) internal pure returns (int256)
+```
+
+**Formula**:
+```solidity
+// φ(x) = (1 / √(2π)) × e^(-x²/2)
+
+int256 coefficient = 0.398942280401433e18;  // 1 / √(2π)
+int256 exponent = x.mul(x).div(2e18).neg();  // -x²/2
+
+return coefficient.mul(exponent.exp());
+```
+
+### Helper Functions
+
+**Calculate d1**:
+```solidity
+function _calculateD1(
+    uint256 spotPrice,
+    uint256 strikePrice,
+    uint256 timeToExpiry,
+    uint256 volatility,
+    uint256 riskFreeRate
+) internal pure returns (int256 d1)
+```
+
+**Calculate d2**:
+```solidity
+function _calculateD2(
+    uint256 spotPrice,
+    uint256 strikePrice,
+    uint256 timeToExpiry,
+    uint256 volatility,
+    uint256 riskFreeRate
+) internal pure returns (int256 d2)
+```
+
+Simply: `d2 = d1 - σ × √T`
+
+## SABR.sol - Volatility Smile Modeling
+
+### Overview
+
+Implements the SABR (Stochastic Alpha Beta Rho) model for modeling volatility surfaces with realistic smiles and skews.
+
+### Library Structure
+
+```solidity
+library SABR {
+    using PRBMathSD59x18 for int256;
+    using PRBMathUD60x18 for uint256;
+}
+```
+
+### SABR Model
+
+**Purpose**: Model how implied volatility changes with strike and time, capturing:
+- **Smile**: Higher volatility for OTM options
+- **Skew**: Asymmetry between put and call volatility
+- **Term Structure**: Volatility changes over time
+
+**Parameters**:
+- **α (alpha)**: Overall volatility level (scales the surface)
+- **β (beta)**: Backbone parameter (0 = normal model, 1 = lognormal model)
+- **ρ (rho)**: Correlation between price and volatility (-1 to 1)
+- **ν (nu/volvol)**: Volatility of volatility (smile convexity)
+
+### Main Function
+
+```solidity
+function calculateIV(
+    uint256 forward,        // Forward price of underlying
+    uint256 strike,         // Strike price
+    uint256 timeToExpiry,   // Time in seconds
+    int32 alpha,            // α parameter (e18)
+    int32 beta,             // β parameter (e18)
+    int32 rho,              // ρ parameter (e18)
+    int32 volvol            // ν parameter (e18)
+) public pure returns (uint256 impliedVol)
+```
+
+### SABR Formula Implementation
+
+**Step 1: Calculate z parameter**:
+```solidity
+// z = (ν/α) × (F × K)^((1-β)/2) × ln(F/K)
+
+int256 F = int256(forward);
+int256 K = int256(strike);
+int256 nu = int256(volvol);
+int256 a = int256(alpha);
+int256 b = int256(beta);
+
+int256 FK_term = F.mul(K).pow((1e18.sub(b)).div(2e18));
+int256 ln_FK = F.div(K).ln();
+
+int256 z = nu.mul(FK_term).mul(ln_FK).div(a);
+```
+
+**Step 2: Calculate x(z)**:
+```solidity
+// x(z) = ln[(√(1 - 2ρz + z²) + z - ρ) / (1 - ρ)]
+
+int256 rho_term = 1e18.sub(2e18.mul(rho).mul(z)).add(z.mul(z));
+int256 sqrt_term = rho_term.sqrt();
+int256 numerator = sqrt_term.add(z).sub(rho);
+int256 denominator = 1e18.sub(rho);
+
+int256 x = numerator.div(denominator).ln();
+```
+
+**Step 3: Calculate base volatility**:
+```solidity
+// σ_base = α × (F × K)^((1-β)/2)
+
+int256 sigma_base = a.mul(FK_term);
+```
+
+**Step 4: Calculate adjustment factor**:
+```solidity
+// Adjustment for ATM vs OTM
+// A complex formula involving ρ, β, and ν
+
+int256 adjustment = _calculateAdjustment(
+    forward, strike, timeToExpiry,
+    alpha, beta, rho, volvol,
+    z, x
+);
+```
+
+**Step 5: Final IV**:
+```solidity
+// σ_implied = σ_base × (z/x) × adjustment
+
+impliedVol = uint256(
+    sigma_base.mul(z).div(x).mul(adjustment)
+);
+```
+
+### Edge Cases
+
+**At-The-Money** (F ≈ K):
+```solidity
+if (abs(F - K) < 0.0001e18) {
+    // Use ATM approximation
+    impliedVol = uint256(alpha.mul(_atmAdjustment(timeToExpiry, beta, rho, volvol)));
+}
+```
+
+**Very Far OTM** (large |ln(F/K)|):
+```solidity
+if (abs(ln_FK) > 2e18) {
+    // Cap extrapolation
+    impliedVol = _capExtrapolation(forward, strike, alpha, beta);
+}
+```
+
+### Calibration
+
+Parameters are calibrated externally by fitting to market option prices, then set in VolatilityFeed.sol:
+
+```solidity
+// Example calibrated parameters for ETH 30-day options
+volatilityFeed.setSABR(
+    30 days,           // tenor
+    50e18,             // callAlpha (50%)
+    50e16,             // callBeta (0.5, between normal and lognormal)
+    -20e16,            // callRho (-0.2, negative correlation)
+    80e16,             // callVolvol (0.8)
+    55e18,             // putAlpha (55%, higher for puts)
+    50e16,             // putBeta
+    -30e16,            // putRho (more negative for puts)
+    90e16              // putVolvol
+);
+```
+
+## OptionsCompute.sol - Option Utilities
+
+### Overview
+
+Utility functions for option calculations, conversions, and validations.
+
+### Key Functions
+
+**Convert Amount to Contract Size**:
+```solidity
+function convertToDecimals(
+    uint256 amount,
+    uint8 decimalsFrom,
+    uint8 decimalsTo
+) public pure returns (uint256)
+```
+
+**Calculate Collateral Required**:
+```solidity
+function getCollateralRequirements(
+    Types.OptionSeries memory optionSeries,
+    uint256 amount
+) public pure returns (uint256 collateral)
+```
+
+For **calls**: `collateral = amount × 1 underlying token`
+For **puts**: `collateral = amount × strike price`
+
+**Calculate Intrinsic Value**:
+```solidity
+function calculateIntrinsicValue(
+    Types.OptionSeries memory optionSeries,
+    uint256 underlyingPrice
+) public pure returns (uint256 intrinsicValue)
+```
+
+**Call Intrinsic**:
+```solidity
+if (underlyingPrice > optionSeries.strike) {
+    intrinsicValue = underlyingPrice - optionSeries.strike;
+} else {
+    intrinsicValue = 0;
+}
+```
+
+**Put Intrinsic**:
+```solidity
+if (optionSeries.strike > underlyingPrice) {
+    intrinsicValue = optionSeries.strike - underlyingPrice;
+} else {
+    intrinsicValue = 0;
+}
+```
+
+**Calculate Time Value**:
+```solidity
+function calculateTimeValue(
+    uint256 optionPrice,
+    uint256 intrinsicValue
+) public pure returns (uint256 timeValue)
+```
+
+Simply: `timeValue = optionPrice - intrinsicValue`
+
+**Check if ITM/OTM/ATM**:
+```solidity
+function getMoneyness(
+    Types.OptionSeries memory optionSeries,
+    uint256 underlyingPrice
+) public pure returns (Moneyness)
+```
+
+```solidity
+enum Moneyness { ITM, ATM, OTM }
+```
+
+## OpynInteractions.sol - Opyn Protocol Interface
+
+### Overview
+
+Handles all interactions with Opyn's Gamma Protocol for option minting, burning, and settlement.
+
+### Key Functions
+
+**Create oToken**:
+```solidity
+function createOtoken(
+    address oTokenFactory,
+    address underlying,
+    address strike,
+    address collateral,
+    uint256 strikePrice,
+    uint256 expiry,
+    bool isPut
+) public returns (address otokenAddress)
+```
+
+Calls Opyn's factory to create new option token.
+
+**Mint Options**:
+```solidity
+function mintOtoken(
+    address gammaController,
+    address marginPool,
+    address otoken,
+    uint256 amount,
+    uint256 vaultId
+) public
+```
+
+Creates IController.ActionArgs to mint options:
+```solidity
+IController.ActionArgs[] memory actions = new IController.ActionArgs[](3);
+
+// Action 1: Open vault or use existing
+actions[0] = IController.ActionArgs({
+    actionType: IController.ActionType.OpenVault,
+    owner: address(this),
+    secondAddress: address(0),
+    asset: address(0),
+    vaultId: vaultId,
+    amount: 0,
+    index: 0,
+    data: ""
+});
+
+// Action 2: Deposit collateral
+actions[1] = IController.ActionArgs({
+    actionType: IController.ActionType.DepositCollateral,
+    owner: address(this),
+    secondAddress: address(this),
+    asset: collateral,
+    vaultId: vaultId,
+    amount: collateralAmount,
+    index: 0,
+    data: ""
+});
+
+// Action 3: Mint oTokens
+actions[2] = IController.ActionArgs({
+    actionType: IController.ActionType.MintShortOption,
+    owner: address(this),
+    secondAddress: address(this),
+    asset: otoken,
+    vaultId: vaultId,
+    amount: amount,
+    index: 0,
+    data: ""
+});
+
+IController(gammaController).operate(actions);
+```
+
+**Burn Options**:
+```solidity
+function burnOtoken(
+    address gammaController,
+    address otoken,
+    uint256 amount,
+    uint256 vaultId
+) public
+```
+
+Burns oTokens and returns collateral.
+
+**Settle Vault**:
+```solidity
+function settleVault(
+    address gammaController,
+    uint256 vaultId
+) public
+```
+
+Called after expiry to settle and retrieve payout.
+
+## Types.sol - Shared Data Structures
+
+### Overview
+
+Defines all shared types and structs used across contracts.
+
+### Key Types
+
+**OptionSeries**:
+```solidity
+struct OptionSeries {
+    uint64 expiration;        // Expiry timestamp
+    uint128 strike;           // Strike price (e18)
+    bool isPut;               // true = put, false = call
+    address underlying;       // Underlying token (e.g., WETH)
+    address strikeAsset;      // Strike denomination (e.g., USDC)
+    address collateral;       // Collateral token
+}
+```
+
+**OptionParams**:
+```solidity
+struct OptionParams {
+    uint16 maxNetDhvExposure;        // Max delta exposure
+    uint16 maxSkewScalar;             // Max skew multiplier
+    uint16 minSkewScalar;             // Min skew multiplier
+    uint16 maxCallDexAlpha;           // Call delta expo alpha
+    uint16 minCallDexAlpha;           // Call delta expo alpha
+    uint16 maxPutDexAlpha;            // Put delta expo alpha
+    uint16 minPutDexAlpha;            // Put delta expo alpha
+}
+```
+
+**Order** (for AlphaOptionHandler):
+```solidity
+struct Order {
+    OptionSeries optionSeries;
+    uint256 amount;
+    uint256 price;
+    uint256 orderExpiry;
+    address buyer;
+    address seriesAddress;
+    bool isBuyBack;
+}
+```
+
+**DepositReceipt**:
+```solidity
+struct DepositReceipt {
+    uint128 epoch;
+    uint128 amount;
+    uint256 unredeemedShares;
+}
+```
+
+**WithdrawalReceipt**:
+```solidity
+struct WithdrawalReceipt {
+    uint128 epoch;
+    uint128 shares;
+}
+```
+
+## CustomErrors.sol - Error Handling
+
+### Overview
+
+Custom errors for gas-efficient error handling (instead of string revert messages).
+
+### Error Definitions
+
+```solidity
+error NotKeeper();
+error NotManager();
+error NotHandler();
+error InvalidExpiry();
+error InvalidStrike();
+error InvalidAmount();
+error InsufficientBalance();
+error InsufficientCollateral();
+error ExceedsMaxTradeSize();
+error BelowMinTradeSize();
+error OptionNotApproved();
+error PremiumTooHigh();
+error EpochNotExecuted();
+error EpochNotReady();
+error VaultNotFound();
+error SeriesNotFound();
+error OracleNotSet();
+error PriceStale();
+error InvalidPrice();
+error CollateralNotApproved();
+error NonExistentVault();
+```
+
+Usage:
+```solidity
+if (msg.sender != keeper) revert NotKeeper();
+if (amount > maxTradeSize) revert ExceedsMaxTradeSize();
+```
+
+## AccessControl.sol - Role Management
+
+### Overview
+
+Implements role-based access control with role hierarchy.
+
+### Implementation
+
+```solidity
+library AccessControl {
+    bytes32 public constant MANAGER_ROLE = keccak256("MANAGER");
+    bytes32 public constant KEEPER_ROLE = keccak256("KEEPER");
+    bytes32 public constant GOVERNANCE_ROLE = keccak256("GOVERNANCE");
+    
+    function hasRole(
+        mapping(bytes32 => mapping(address => bool)) storage roles,
+        bytes32 role,
+        address account
+    ) internal view returns (bool) {
+        return roles[role][account];
+    }
+    
+    function grantRole(
+        mapping(bytes32 => mapping(address => bool)) storage roles,
+        bytes32 role,
+        address account
+    ) internal {
+        roles[role][account] = true;
+    }
+    
+    function revokeRole(
+        mapping(bytes32 => mapping(address => bool)) storage roles,
+        bytes32 role,
+        address account
+    ) internal {
+        roles[role][account] = false;
+    }
+}
+```
+
+Usage in contracts:
+```solidity
+mapping(bytes32 => mapping(address => bool)) private _roles;
+
+modifier onlyManager() {
+    require(
+        AccessControl.hasRole(_roles, AccessControl.MANAGER_ROLE, msg.sender),
+        "Not manager"
+    );
+    _;
+}
+```
+
+## SafeTransferLib.sol - Safe Token Transfers
+
+### Overview
+
+Gas-optimized, safe token transfer library handling various ERC20 implementations.
+
+### Key Functions
+
+```solidity
+function safeTransfer(
+    address token,
+    address to,
+    uint256 amount
+) internal
+```
+
+```solidity
+function safeTransferFrom(
+    address token,
+    address from,
+    address to,
+    uint256 amount
+) internal
+```
+
+```solidity
+function safeApprove(
+    address token,
+    address spender,
+    uint256 amount
+) internal
+```
+
+**Safety Features**:
+- Handles tokens that don't return bool
+- Reverts on failure
+- No reentrancy vulnerabilities
+- Gas-optimized assembly
+
+---
+
+**Key Takeaways**:
+- ✅ BlackScholes library provides accurate options pricing
+- ✅ SABR model captures realistic volatility dynamics
+- ✅ Comprehensive Greeks calculations for risk management
+- ✅ Type-safe data structures prevent errors
+- ✅ Gas-optimized libraries reduce costs
+- ✅ Custom errors provide clear failure reasons
